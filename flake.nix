@@ -65,7 +65,7 @@
           version = "0.2.0";
           src = nixpkgs.lib.cleanSource ./.;
           useFetchCargoVendor = true;
-          cargoHash = "";
+          cargoHash = "sha256-AN267ZgjpgXtfwjoYlj6d+xuIZL0+KA8EqQQQz/pSes=";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.alsa-lib pkgs.openssl ];
           meta = {
