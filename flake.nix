@@ -1,13 +1,16 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, crane }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system:
-        f { pkgs = import nixpkgs { inherit system; }; });
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
+        pkgs = import nixpkgs { inherit system; };
+        craneLib = crane.mkLib (import nixpkgs { inherit system; });
+      });
     in {
       nixosModules.default = { config, lib, pkgs, ... }:
         let
@@ -60,19 +63,14 @@
           };
         };
 
-      packages = forAllSystems ({ pkgs }: {
-        default = pkgs.rustPlatform.buildRustPackage {
+      packages = forAllSystems ({ pkgs, craneLib }: {
+        default = craneLib.buildPackage {
           pname = "dictate";
           version = "0.2.0";
-          src = nixpkgs.lib.cleanSource ./.;
-          useFetchCargoVendor = true;
-          cargoHash = "";
+          src = craneLib.cleanCargoSource ./.;
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.alsa-lib pkgs.openssl ];
-          meta = {
-            description = "Voice-to-text dictation daemon with evdev keybind";
-            mainProgram = "dictate";
-          };
+          meta.mainProgram = "dictate";
         };
       });
     };
