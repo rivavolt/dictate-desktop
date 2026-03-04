@@ -39,6 +39,7 @@ pub enum Command {
     SetText(String),
     SetPending(String),
     Copied,
+    SetFont(String),
 }
 
 #[derive(Clone)]
@@ -66,6 +67,10 @@ impl Handle {
 
     pub fn copied(&self) {
         let _ = self.tx.send(Command::Copied);
+    }
+
+    pub fn set_font(&self, name: String) {
+        let _ = self.tx.send(Command::SetFont(name));
     }
 }
 
@@ -324,6 +329,19 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                     } else {
                         state.shrink_target = 1.0;
                         state.redraw();
+                    }
+                }
+                Command::SetFont(name) => {
+                    match find_font_path(&name) {
+                        Ok(path) => match state.canvas.add_font(&path) {
+                            Ok(id) => {
+                                state.font_id = id;
+                                state.wrapped_dirty = true;
+                                tracing::info!("overlay: font changed to {name} ({path})");
+                            }
+                            Err(e) => tracing::error!("overlay: failed to load font {path}: {e}"),
+                        }
+                        Err(e) => tracing::error!("overlay: font lookup failed for {name}: {e}"),
                     }
                 }
             }

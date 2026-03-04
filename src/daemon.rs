@@ -384,9 +384,29 @@ impl DaemonState {
             }
             "font" => {
                 if let Some(f) = req.arg {
-                    let _ = fs::write(&self.config.font_file, &f);
-                    self.state.font = f.clone();
-                    ipc::Response::ok(format!("font: {} (restart daemon to apply)", f))
+                    match std::process::Command::new("fc-match")
+                        .args(["--format", "%{family}", &f])
+                        .output()
+                    {
+                        Ok(out) => {
+                            let matched = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !matched.to_lowercase().contains(&f.to_lowercase()) {
+                                return ipc::Response::err(format!(
+                                    "font '{f}' not found (fc-match resolved to '{matched}')"
+                                ));
+                            }
+                            let _ = fs::write(&self.config.font_file, &f);
+                            self.state.font = f.clone();
+                            self.overlay.set_font(f.clone());
+                            ipc::Response::ok(format!("font: {f}"))
+                        }
+                        Err(_) => {
+                            let _ = fs::write(&self.config.font_file, &f);
+                            self.state.font = f.clone();
+                            self.overlay.set_font(f.clone());
+                            ipc::Response::ok(format!("font: {f} (could not verify)"))
+                        }
+                    }
                 } else {
                     ipc::Response::ok(format!("font: {}", self.state.font))
                 }
