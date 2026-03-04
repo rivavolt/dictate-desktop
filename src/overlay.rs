@@ -213,68 +213,6 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
         })
         .map_err(|e| anyhow::anyhow!("wayland source: {e}"))?;
 
-    let anim_timer = calloop::timer::Timer::immediate();
-    loop_handle
-        .insert_source(anim_timer, |_, _, state| {
-            let mut needs_redraw = false;
-
-            // Fade animation
-            if (state.fade_alpha - state.fade_target).abs() > 0.01 {
-                let step = state.frame_ms as f32 / FADE_DURATION_MS;
-                if state.fade_target > state.fade_alpha {
-                    state.fade_alpha = (state.fade_alpha + step).min(1.0);
-                } else {
-                    state.fade_alpha = (state.fade_alpha - step).max(0.0);
-                }
-                needs_redraw = true;
-            }
-
-            // Pill ↔ full morph animation
-            if (state.shrink_t - state.shrink_target).abs() > 0.01 {
-                let step = state.frame_ms as f32 / SHRINK_DURATION_MS;
-                if state.shrink_target > state.shrink_t {
-                    state.shrink_t = (state.shrink_t + step).min(1.0);
-                } else {
-                    state.shrink_t = (state.shrink_t - step).max(0.0);
-                }
-                if state.shrink_t >= 1.0 && !state.listening {
-                    state.pill_countdown = 0.6;
-                }
-                needs_redraw = true;
-            }
-
-            // "Copied" pill hold → fade
-            if state.pill_countdown > 0.0 {
-                state.pill_countdown -= state.frame_ms as f32 / 1000.0;
-                if state.pill_countdown <= 0.0 {
-                    state.pill_countdown = 0.0;
-                    state.fade_target = 0.0;
-                }
-                needs_redraw = true;
-            }
-
-            // Width animation (compact mode)
-            if (state.render_w - state.content_pw).abs() > 1.0 {
-                let step = (state.content_pw - state.render_w) * (state.frame_ms as f32 / WIDTH_ANIM_MS).min(1.0);
-                state.render_w += step;
-                needs_redraw = true;
-            } else if state.content_pw > 0.0 {
-                state.render_w = state.content_pw;
-            }
-
-            // Pulse animation for listening dot
-            if state.visible && state.listening {
-                state.anim_phase += std::f32::consts::TAU * state.frame_ms as f32 / 1500.0;
-                needs_redraw = true;
-            }
-
-            if needs_redraw {
-                state.redraw();
-            }
-            calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_millis(state.frame_ms))
-        })
-        .map_err(|e| anyhow::anyhow!("anim timer: {e}"))?;
-
     loop_handle.insert_source(cmd_rx, |event, _, state| {
         if let calloop::channel::Event::Msg(cmd) = event {
             match cmd {
@@ -344,7 +282,13 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
     }).map_err(|e| anyhow::anyhow!("cmd channel: {e}"))?;
 
     while !state.exit {
-        event_loop.dispatch(std::time::Duration::from_millis(100), &mut state)?;
+        let timeout = if state.is_animating() {
+            std::time::Duration::from_millis(state.frame_ms)
+        } else {
+            std::time::Duration::from_secs(60)
+        };
+        event_loop.dispatch(timeout, &mut state)?;
+        state.animation_tick();
     }
 
     Ok(())
@@ -388,6 +332,77 @@ struct State {
 }
 
 impl State {
+    fn is_animating(&self) -> bool {
+        self.visible && (
+            (self.fade_alpha - self.fade_target).abs() > 0.01
+            || (self.shrink_t - self.shrink_target).abs() > 0.01
+            || self.pill_countdown > 0.0
+            || (self.render_w - self.content_pw).abs() > 1.0
+            || self.listening
+        )
+    }
+
+    fn animation_tick(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let mut needs_redraw = false;
+
+        // Fade animation
+        if (self.fade_alpha - self.fade_target).abs() > 0.01 {
+            let step = self.frame_ms as f32 / FADE_DURATION_MS;
+            if self.fade_target > self.fade_alpha {
+                self.fade_alpha = (self.fade_alpha + step).min(1.0);
+            } else {
+                self.fade_alpha = (self.fade_alpha - step).max(0.0);
+            }
+            needs_redraw = true;
+        }
+
+        // Pill ↔ full morph animation
+        if (self.shrink_t - self.shrink_target).abs() > 0.01 {
+            let step = self.frame_ms as f32 / SHRINK_DURATION_MS;
+            if self.shrink_target > self.shrink_t {
+                self.shrink_t = (self.shrink_t + step).min(1.0);
+            } else {
+                self.shrink_t = (self.shrink_t - step).max(0.0);
+            }
+            if self.shrink_t >= 1.0 && !self.listening {
+                self.pill_countdown = 0.6;
+            }
+            needs_redraw = true;
+        }
+
+        // "Copied" pill hold → fade
+        if self.pill_countdown > 0.0 {
+            self.pill_countdown -= self.frame_ms as f32 / 1000.0;
+            if self.pill_countdown <= 0.0 {
+                self.pill_countdown = 0.0;
+                self.fade_target = 0.0;
+            }
+            needs_redraw = true;
+        }
+
+        // Width animation (compact mode)
+        if (self.render_w - self.content_pw).abs() > 1.0 {
+            let step = (self.content_pw - self.render_w) * (self.frame_ms as f32 / WIDTH_ANIM_MS).min(1.0);
+            self.render_w += step;
+            needs_redraw = true;
+        } else if self.content_pw > 0.0 {
+            self.render_w = self.content_pw;
+        }
+
+        // Pulse animation for listening dot
+        if self.listening {
+            self.anim_phase += std::f32::consts::TAU * self.frame_ms as f32 / 1500.0;
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            self.redraw();
+        }
+    }
+
     fn update_refresh(&mut self, output: &wl_output::WlOutput) {
         if let Some(info) = self.output_state.info(output) {
             if let Some(mode) = info.modes.iter().find(|m| m.current) {
