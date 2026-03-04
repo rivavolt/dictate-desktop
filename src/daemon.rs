@@ -333,6 +333,12 @@ impl DaemonState {
             }
             "model" => {
                 if let Some(m) = req.arg {
+                    if !m.contains('/') {
+                        return ipc::Response::err(format!(
+                            "format: provider/model (providers: {})",
+                            config::PROVIDERS.join(", ")
+                        ));
+                    }
                     let (provider, model) = config::parse_provider_model(&m);
                     if !config::PROVIDERS.contains(&provider) {
                         return ipc::Response::err(format!(
