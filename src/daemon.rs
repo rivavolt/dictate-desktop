@@ -69,7 +69,6 @@ impl DaemonState {
                 if provider == "groq" {
                     tracing::info!("groq doesn't support live streaming, falling back to deepgram/nova-3");
                     let saved = self.state.model.clone();
-                    self.state.model = "deepgram/nova-3".into();
                     let result = self.start_live(stop, "deepgram");
                     self.state.model = saved;
                     result?;
@@ -226,7 +225,7 @@ impl DaemonState {
                 let chunk = audio_file.clone();
                 let status = tokio::task::spawn_blocking(move || {
                     std::process::Command::new("sox")
-                        .args(["-d", chunk.to_str().unwrap()])
+                        .args(["-d", &chunk.to_string_lossy()])
                         .args(["silence", "1", "0.1", "1%", "1", "0.8", "1%"])
                         .stderr(std::process::Stdio::null())
                         .status()
