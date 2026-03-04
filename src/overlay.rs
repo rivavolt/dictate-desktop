@@ -18,7 +18,10 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, QueueHandle,
+};
+use wayland_protocols_plasma::blur::client::{
+    org_kde_kwin_blur, org_kde_kwin_blur_manager,
 };
 
 const MIN_HEIGHT: u32 = 36;
@@ -29,6 +32,7 @@ const CHAR_WIDTH_RATIO: f32 = 0.47;
 const CORNER_RADIUS: f32 = 12.0;
 const FADE_DURATION_MS: f32 = 150.0;
 const SHRINK_DURATION_MS: f32 = 150.0;
+const WIDTH_ANIM_MS: f32 = 100.0;
 const DOT_RADIUS: f32 = 4.0;
 
 pub enum Command {
@@ -115,6 +119,13 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
+    // Request background blur from compositor (KDE blur protocol, supported by Hyprland)
+    if let Ok(blur_mgr) = globals.bind::<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager, _, _>(&qh, 1..=1, ()) {
+        let blur = blur_mgr.create(layer.wl_surface(), &qh, ());
+        blur.set_region(None); // blur entire surface
+        blur.commit();
+    }
+
     let pool = SlotPool::new(256, &shm)?;
     let mut font_system = FontSystem::new();
     let swash_cache = SwashCache::new();
@@ -137,7 +148,10 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
         pending: String::new(),
         listening: false,
         shrink_t: 0.0,
+        shrink_target: 0.0,
         pill_countdown: 0.0,
+        content_pw: 0.0,
+        render_w: 0.0,
         anim_phase: 0.0,
         fade_alpha: 0.0,
         fade_target: 0.0,
@@ -180,10 +194,15 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                 needs_redraw = true;
             }
 
-            // Shrink-to-pill animation
-            if state.shrink_t > 0.0 && state.shrink_t < 1.0 {
-                state.shrink_t = (state.shrink_t + state.frame_ms as f32 / SHRINK_DURATION_MS).min(1.0);
-                if state.shrink_t >= 1.0 {
+            // Pill ↔ full morph animation
+            if (state.shrink_t - state.shrink_target).abs() > 0.01 {
+                let step = state.frame_ms as f32 / SHRINK_DURATION_MS;
+                if state.shrink_target > state.shrink_t {
+                    state.shrink_t = (state.shrink_t + step).min(1.0);
+                } else {
+                    state.shrink_t = (state.shrink_t - step).max(0.0);
+                }
+                if state.shrink_t >= 1.0 && !state.listening {
                     state.pill_countdown = 0.6;
                 }
                 needs_redraw = true;
@@ -197,6 +216,15 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                     state.fade_target = 0.0;
                 }
                 needs_redraw = true;
+            }
+
+            // Width animation (compact mode)
+            if (state.render_w - state.content_pw).abs() > 1.0 {
+                let step = (state.content_pw - state.render_w) * (state.frame_ms as f32 / WIDTH_ANIM_MS).min(1.0);
+                state.render_w += step;
+                needs_redraw = true;
+            } else if state.content_pw > 0.0 {
+                state.render_w = state.content_pw;
             }
 
             // Pulse animation for listening dot, pending text
@@ -218,27 +246,36 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                 Command::Show => {
                     state.visible = true;
                     state.listening = true;
-                    state.shrink_t = 0.0;
+                    state.shrink_t = 1.0;
+                    state.shrink_target = 1.0;
                     state.pill_countdown = 0.0;
                     state.text.clear();
                     state.pending.clear();
                     state.fade_alpha = 1.0;
                     state.fade_target = 1.0;
+                    // Start render_w at pill size — will be computed properly in redraw
+                    let pill_w = MIN_HEIGHT as f32 * state.scale as f32;
+                    state.content_pw = pill_w;
+                    state.render_w = pill_w;
                     state.resize_and_redraw();
                 }
                 Command::SetText(text) => {
+                    if state.listening {
+                        state.shrink_target = 0.0;
+                    }
                     state.listening = false;
                     state.text = text;
                     state.pending.clear();
-
                     if state.visible {
                         state.resize_and_redraw();
                     }
                 }
                 Command::SetPending(text) => {
+                    if state.listening {
+                        state.shrink_target = 0.0;
+                    }
                     state.listening = false;
                     state.pending = text;
-
                     if state.visible {
                         state.resize_and_redraw();
                     }
@@ -248,7 +285,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                     if state.text.is_empty() {
                         state.fade_target = 0.0;
                     } else {
-                        state.shrink_t = 0.01;
+                        state.shrink_target = 1.0;
                         state.redraw();
                     }
                 }
@@ -280,7 +317,10 @@ struct State {
     pending: String,
     listening: bool,
     shrink_t: f32,
+    shrink_target: f32,
     pill_countdown: f32,
+    content_pw: f32,
+    render_w: f32,
     anim_phase: f32,
     fade_alpha: f32,
     fade_target: f32,
@@ -350,6 +390,16 @@ impl State {
             .shape_until_scroll(&mut self.font_system, false);
 
         let lines = self.text_buffer.layout_runs().count().max(1) as u32;
+        self.content_pw = if lines > 1 {
+            pw as f32
+        } else {
+            let widest = self.text_buffer.layout_runs()
+                .map(|run| run.line_w)
+                .fold(0.0f32, f32::max);
+            (widest + PADDING_X as f32 * s * 2.0)
+                .max(MIN_HEIGHT as f32 * s)
+                .min(pw as f32)
+        };
         let h = PADDING_Y as u32 * 2 + lines * self.line_height as u32;
         h.max(MIN_HEIGHT).min(self.max_height)
     }
@@ -423,9 +473,14 @@ impl State {
             0.0
         };
 
-        let bg_alpha = (0xB0 as f32 * self.fade_alpha) as u8;
+        let bg_alpha = (0x99 as f32 * self.fade_alpha) as u8;
         let target_h = MIN_HEIGHT as f32 * sf;
-        // Measure "Copied" text width via layout
+        // Measure pill label width via layout
+        let pill_label = if self.listening || self.shrink_target < 0.5 {
+            "Recording"
+        } else {
+            "Copied"
+        };
         let target_w = {
             let font_family = Family::Name(&self.font_name);
             self.text_buffer.set_metrics(
@@ -434,7 +489,7 @@ impl State {
             );
             self.text_buffer.set_text(
                 &mut self.font_system,
-                "Copied",
+                pill_label,
                 &Attrs::new().family(font_family),
                 Shaping::Advanced,
             );
@@ -443,17 +498,25 @@ impl State {
             let w = self.text_buffer.layout_runs()
                 .map(|run| run.line_w)
                 .fold(0.0f32, f32::max);
-            w + PADDING_X as f32 * sf * 2.0
+            // Extra space for red dot indicator when recording
+            let dot_space = if self.listening || self.shrink_target < 0.5 {
+                DOT_RADIUS * sf * 2.0 + 8.0 * sf
+            } else {
+                0.0
+            };
+            w + dot_space + PADDING_X as f32 * sf * 2.0
         }.max(target_h);
 
+        let base_w = self.render_w.min(pw as f32).max(target_h);
         let (rx, ry, rw, rh) = if ease_t > 0.0 {
-            let rw = pw as f32 + (target_w - pw as f32) * ease_t;
+            let rw = base_w + (target_w - base_w) * ease_t;
             let rh = ph as f32 + (target_h - ph as f32) * ease_t;
             let rx = (pw as f32 - rw) / 2.0;
             let ry = ph as f32 - rh;
             (rx, ry, rw, rh)
         } else {
-            (0.0, 0.0, pw as f32, ph as f32)
+            let rx = (pw as f32 - base_w) / 2.0;
+            (rx, 0.0, base_w, ph as f32)
         };
 
         let r_top = if ease_t > 0.0 {
@@ -478,7 +541,7 @@ impl State {
             pb.finish().unwrap()
         };
         let mut paint = tiny_skia::Paint::default();
-        paint.set_color(tiny_skia::Color::from_rgba8(0x1a, 0x1a, 0x2e, bg_alpha));
+        paint.set_color(tiny_skia::Color::from_rgba8(0x00, 0x00, 0x00, bg_alpha));
         paint.anti_alias = true;
         pixmap.fill_path(&rrect, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
 
@@ -489,17 +552,42 @@ impl State {
         stroke.width = sf;
         pixmap.stroke_path(&rrect, &border_paint, &stroke, tiny_skia::Transform::identity(), None);
 
-        // Text fades out in the first 25% of shrink
-        let text_opacity = if ease_t > 0.0 { (1.0 - ease_t * 4.0).max(0.0) } else { 1.0 };
+        // Text fades based on how pill-like the rect is
+        let text_opacity = (1.0 - ease_t * 4.0).max(0.0);
         let text_alpha = (0xFF as f32 * self.fade_alpha * text_opacity) as u8;
+        // Pill label (Recording/Copied) visible when rect is pill-shaped
+        let pill_label_opacity = if ease_t > 0.5 { ((ease_t - 0.5) * 2.0).min(1.0) } else { 0.0 };
+        let pill_alpha = (0xFF as f32 * self.fade_alpha * pill_label_opacity) as u8;
 
-        let compact_pill = self.listening;
+        let show_pill = (self.listening || self.pill_countdown > 0.0 || pill_alpha > 0) && ease_t > 0.5;
 
-        let copied_pill = self.shrink_t >= 1.0 && self.pill_countdown > 0.0;
+        if show_pill {
+            let dot_r = DOT_RADIUS * sf;
+            let is_recording = self.listening || self.shrink_target < 0.5;
+            let label = if is_recording { "Recording" } else { "Copied" };
+            let label_color = if is_recording {
+                Color::rgba(0x99, 0x99, 0x99, pill_alpha)
+            } else {
+                Color::rgba(0xCC, 0xCC, 0xCC, pill_alpha)
+            };
 
-        if copied_pill {
-            // "Copied" pill at center
-            let pill_alpha = (0xFF as f32 * self.fade_alpha) as u8;
+            // Red dot for recording
+            if is_recording {
+                let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6;
+                let dot_alpha = (pulse * pill_alpha as f32) as u8;
+                let ind_x = rx + PADDING_X as f32 * sf + dot_r;
+                let ind_y = ry + rh / 2.0;
+                let dot_path = {
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    pb.push_circle(ind_x, ind_y, dot_r);
+                    pb.finish().unwrap()
+                };
+                let mut dot_paint = tiny_skia::Paint::default();
+                dot_paint.set_color(tiny_skia::Color::from_rgba8(0xE0, 0x40, 0x40, dot_alpha));
+                dot_paint.anti_alias = true;
+                pixmap.fill_path(&dot_path, &dot_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+            }
+
             let font_family = Family::Name(&self.font_name);
             self.text_buffer.set_metrics(
                 &mut self.font_system,
@@ -507,13 +595,14 @@ impl State {
             );
             self.text_buffer.set_text(
                 &mut self.font_system,
-                "Copied",
+                label,
                 &Attrs::new().family(font_family),
                 Shaping::Advanced,
             );
+            let dot_offset = if is_recording { dot_r * 2.0 + 8.0 * sf } else { 0.0 };
             self.text_buffer.set_size(
                 &mut self.font_system,
-                Some(rw - PADDING_X as f32 * sf * 2.0),
+                None,
                 None,
             );
             self.text_buffer
@@ -521,14 +610,14 @@ impl State {
 
             let cw = pw as i32;
             let ch = ph as i32;
-            let text_x = rx as i32 + (PADDING_X as f32 * sf) as i32;
+            let text_x = rx as i32 + (PADDING_X as f32 * sf + dot_offset) as i32;
             let text_y = ry as i32 + ((rh - self.line_height * sf) / 2.0) as i32;
             let pixels = pixmap.pixels_mut();
 
             self.text_buffer.draw(
                 &mut self.font_system,
                 &mut self.swash_cache,
-                Color::rgba(0xCC, 0xCC, 0xCC, pill_alpha),
+                label_color,
                 |x, y, w, h, color| {
                     let x = x + text_x;
                     let y = y + text_y;
@@ -553,86 +642,14 @@ impl State {
                     }
                 },
             );
-        } else if text_alpha == 0 {
-            // Shrink animation in progress — no text to render
-        } else if compact_pill {
-            let dot_r = DOT_RADIUS * sf;
-            let ind_x = PADDING_X as f32 * sf + dot_r;
-            let ind_y = ph as f32 / 2.0;
+        }
 
-            // Pulsing red dot
-            let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6;
-            let dot_alpha = (pulse * text_alpha as f32) as u8;
-            let dot_path = {
-                let mut pb = tiny_skia::PathBuilder::new();
-                pb.push_circle(ind_x, ind_y, dot_r);
-                pb.finish().unwrap()
-            };
-            let mut dot_paint = tiny_skia::Paint::default();
-            dot_paint.set_color(tiny_skia::Color::from_rgba8(0xE0, 0x40, 0x40, dot_alpha));
-            dot_paint.anti_alias = true;
-            pixmap.fill_path(&dot_path, &dot_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-
-            let label = "Listening...";
-            let font_family = Family::Name(&self.font_name);
-            self.text_buffer.set_metrics(
-                &mut self.font_system,
-                Metrics::new(self.font_size * sf, self.line_height * sf),
-            );
-            self.text_buffer.set_text(
-                &mut self.font_system,
-                label,
-                &Attrs::new().family(font_family),
-                Shaping::Advanced,
-            );
-            self.text_buffer.set_size(
-                &mut self.font_system,
-                Some((pw as i32 - PADDING_X * s * 2) as f32 - dot_r * 2.0 - 8.0 * sf),
-                None,
-            );
-            self.text_buffer
-                .shape_until_scroll(&mut self.font_system, false);
-
-            let cw = pw as i32;
-            let ch = ph as i32;
-            let text_offset_x = PADDING_X * s + (dot_r * 2.0 + 8.0 * sf) as i32;
-            let pad_y = (ch - self.line_height as i32 * s) / 2;
-            let pixels = pixmap.pixels_mut();
-
-            self.text_buffer.draw(
-                &mut self.font_system,
-                &mut self.swash_cache,
-                Color::rgba(0x99, 0x99, 0x99, text_alpha),
-                |x, y, w, h, color| {
-                    let x = x + text_offset_x;
-                    let y = y + pad_y;
-                    let a = color.a();
-                    if a == 0 { return; }
-                    let a32 = a as u32;
-                    let src = tiny_skia::PremultipliedColorU8::from_rgba(
-                        ((color.r() as u32 * a32) / 255) as u8,
-                        ((color.g() as u32 * a32) / 255) as u8,
-                        ((color.b() as u32 * a32) / 255) as u8,
-                        a,
-                    ).unwrap();
-                    for row in y..(y + h as i32).min(ch) {
-                        if row < 0 { continue; }
-                        for col in x..(x + w as i32).min(cw) {
-                            if col < 0 { continue; }
-                            let idx = (row * cw + col) as usize;
-                            if idx < pixels.len() {
-                                pixels[idx] = blend_over(pixels[idx], src);
-                            }
-                        }
-                    }
-                },
-            );
-        } else {
+        if text_alpha > 0 && !show_pill {
             // Normal text rendering
             let final_text = self.text.clone();
             let pending_str = if self.pending.is_empty() {
                 String::new()
-            } else if self.text.is_empty() {
+            } else if self.text.is_empty() || self.text.ends_with(' ') {
                 self.pending.clone()
             } else {
                 format!(" {}", self.pending)
@@ -681,7 +698,7 @@ impl State {
 
             let cw = pw as i32;
             let ch = ph as i32;
-            let pad_x = PADDING_X * s;
+            let pad_x = rx as i32 + PADDING_X * s;
             let text_h = total_text_h.min(visible_h) as i32;
             let pad_y = (ch - text_h) - PADDING_Y * s;
             let pixels = pixmap.pixels_mut();
@@ -816,6 +833,14 @@ delegate_output!(State);
 delegate_shm!(State);
 delegate_layer!(State);
 delegate_registry!(State);
+
+impl Dispatch<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager, ()> for State {
+    fn event(_: &mut Self, _: &org_kde_kwin_blur_manager::OrgKdeKwinBlurManager, _: <org_kde_kwin_blur_manager::OrgKdeKwinBlurManager as wayland_client::Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<org_kde_kwin_blur::OrgKdeKwinBlur, ()> for State {
+    fn event(_: &mut Self, _: &org_kde_kwin_blur::OrgKdeKwinBlur, _: <org_kde_kwin_blur::OrgKdeKwinBlur as wayland_client::Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
 
 impl ProvidesRegistryState for State {
     fn registry(&mut self) -> &mut RegistryState {
