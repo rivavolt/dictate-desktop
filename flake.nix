@@ -41,7 +41,7 @@
 
               serviceConfig = {
                 Environment = [
-                  "PATH=${lib.makeBinPath [ pkgs.pipewire pkgs.sox ]}"
+                  "PATH=${lib.makeBinPath [ pkgs.pipewire pkgs.sox pkgs.fontconfig ]}"
                   "XDG_RUNTIME_DIR=/run/user/%U"
                   "FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.inter ]; }}"
                 ];

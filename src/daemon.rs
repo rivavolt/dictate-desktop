@@ -24,12 +24,12 @@ struct DaemonState {
     stop_flag: Option<Arc<AtomicBool>>,
     _audio_stream: Option<cpal::Stream>,
     record_handle: Option<tokio::task::JoinHandle<()>>,
-    tray_handle: ksni::Handle<tray::DictateTray>,
+    tray_handle: Option<ksni::Handle<tray::DictateTray>>,
     overlay: overlay::Handle,
 }
 
 impl DaemonState {
-    fn new(tray_handle: ksni::Handle<tray::DictateTray>, overlay: overlay::Handle) -> Self {
+    fn new(tray_handle: Option<ksni::Handle<tray::DictateTray>>, overlay: overlay::Handle) -> Self {
         let config = Config::new();
         let state = State::load(&config);
         Self {
@@ -52,8 +52,9 @@ impl DaemonState {
         self.recording = true;
         fs::write(&self.config.state_file, "recording")?;
         sound::play_start();
-        let tray = self.tray_handle.clone();
-        tokio::spawn(async move { tray.update(|t| t.set_recording(true)).await; });
+        if let Some(tray) = self.tray_handle.clone() {
+            tokio::spawn(async move { tray.update(|t| t.set_recording(true)).await; });
+        }
         if self.state.output == "clipboard" {
             self.overlay.show();
         }
@@ -293,8 +294,9 @@ impl DaemonState {
         self.recording = false;
         fs::write(&self.config.state_file, "idle")?;
         sound::play_stop();
-        let tray = self.tray_handle.clone();
-        tokio::spawn(async move { tray.update(|t| t.set_recording(false)).await; });
+        if let Some(tray) = self.tray_handle.clone() {
+            tokio::spawn(async move { tray.update(|t| t.set_recording(false)).await; });
+        }
 
         Ok("stopped".into())
     }
@@ -450,7 +452,13 @@ impl DaemonState {
 
 pub async fn run() -> Result<()> {
     let (tray_tx, mut tray_rx) = mpsc::channel::<()>(4);
-    let tray_handle = tray::spawn(tray_tx).await?;
+    let tray_handle = match tray::spawn(tray_tx).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::warn!("tray unavailable: {e}");
+            None
+        }
+    };
 
     let (fn_tx, mut fn_rx) = mpsc::channel::<fnkey::KeyEvent>(16);
     tokio::spawn(async move {
