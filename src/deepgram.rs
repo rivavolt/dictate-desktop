@@ -82,20 +82,12 @@ pub async fn stream_live(
     });
 
     let mut full_transcript = String::new();
-    let stop_recv = stop.clone();
 
     let receiver_task = tokio::spawn(async move {
         loop {
-            let msg = if stop_recv.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_millis(200), ws_rx.next()).await {
-                    Ok(Some(Ok(msg))) => msg,
-                    _ => break,
-                }
-            } else {
-                match ws_rx.next().await {
-                    Some(Ok(msg)) => msg,
-                    _ => break,
-                }
+            let msg = match ws_rx.next().await {
+                Some(Ok(msg)) => msg,
+                _ => break,
             };
 
             let Message::Text(text) = msg else {
