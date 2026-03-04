@@ -47,6 +47,11 @@ pub struct Handle {
 }
 
 impl Handle {
+    pub fn dummy() -> Self {
+        let (tx, _rx) = calloop::channel::channel::<Command>();
+        Self { tx }
+    }
+
     pub fn show(&self) {
         let _ = self.tx.send(Command::Show);
     }
@@ -72,7 +77,7 @@ pub fn spawn(font: String) -> Result<Handle> {
         .name("overlay".into())
         .spawn(move || {
             if let Err(e) = run(rx, &font) {
-                tracing::error!("overlay thread: {e}");
+                tracing::error!("overlay: {e}");
             }
         })?;
 
@@ -783,7 +788,9 @@ impl LayerShellHandler for State {
             let content_w = overlay_w as f32 - PADDING_X * 2.0;
             self.font_size = content_w / (100.0 * CHAR_WIDTH_RATIO);
             self.line_height = self.font_size * 1.5;
-            self.max_height = (overlay_w as f64 * OVERLAY_WIDTH_FRAC) as u32;
+            let golden_h = (overlay_w as f32 / 1.618) as u32;
+            let max_lines = ((golden_h as f32 - PADDING_Y * 2.0) / self.line_height).floor().max(1.0) as u32;
+            self.max_height = PADDING_Y as u32 * 2 + max_lines * self.line_height as u32;
             self.layer.set_margin(0, margin_h, margin_b, margin_h);
             self.width = overlay_w;
         } else {

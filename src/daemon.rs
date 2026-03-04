@@ -490,7 +490,13 @@ pub async fn run() -> Result<()> {
     let config = Config::new();
     let state = State::load(&config);
 
-    let overlay_handle = overlay::spawn(state.font.clone())?;
+    let overlay_handle = match overlay::spawn(state.font.clone()) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("overlay unavailable: {e}");
+            overlay::Handle::dummy()
+        }
+    };
 
     let mut daemon = DaemonState::new(tray_handle, overlay_handle);
 
