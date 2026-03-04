@@ -34,7 +34,7 @@ fn tone_wav(freq: f32, duration_ms: u32, sample_rate: u32) -> Vec<u8> {
         } else {
             1.0
         };
-        let sample = (t * freq * 2.0 * std::f32::consts::PI).sin() * 0.3 * envelope;
+        let sample = (t * freq * 2.0 * std::f32::consts::PI).sin() * 0.1 * envelope;
         let pcm = (sample * 32767.0) as i16;
         buf.extend_from_slice(&pcm.to_le_bytes());
     }

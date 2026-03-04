@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
+
+pub const PROVIDERS: &[&str] = &["deepgram", "groq", "fireworks"];
 
 pub struct Config {
     pub state_file: PathBuf,
@@ -10,6 +12,7 @@ pub struct Config {
     pub mode_file: PathBuf,
     pub output_file: PathBuf,
     pub font_file: PathBuf,
+    pub model_file: PathBuf,
     pub socket_path: PathBuf,
 }
 
@@ -31,29 +34,29 @@ impl Config {
             mode_file: state_dir.join("mode"),
             output_file: state_dir.join("output"),
             font_file: state_dir.join("font"),
+            model_file: state_dir.join("model"),
             socket_path: runtime_dir.join("dictate.sock"),
         }
     }
 }
 
-pub fn get_api_key() -> Result<String> {
-    std::env::var("DEEPGRAM_API_KEY")
-        .or_else(|_| {
-            let env_file = dirs::home_dir().unwrap_or_default().join(".config/env");
-            if let Ok(content) = fs::read_to_string(&env_file) {
-                for line in content.lines() {
-                    if line.starts_with("export DEEPGRAM_API_KEY=") {
-                        return Ok(line
-                            .trim_start_matches("export DEEPGRAM_API_KEY=")
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string());
-                    }
-                }
-            }
-            Err(std::env::VarError::NotPresent)
-        })
-        .context("DEEPGRAM_API_KEY not set in env or ~/.config/env")
+/// Split "provider/model" into (provider, model). Returns ("deepgram", full) if no slash.
+pub fn parse_provider_model(s: &str) -> (&str, &str) {
+    match s.split_once('/') {
+        Some((provider, model)) => (provider, model),
+        None => ("deepgram", s),
+    }
+}
+
+pub fn get_api_key(provider: &str) -> Result<String> {
+    let env_var = match provider {
+        "deepgram" => "DEEPGRAM_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "fireworks" => "FIREWORKS_API_KEY",
+        other => bail!("unknown provider: {other}"),
+    };
+
+    std::env::var(env_var).context(format!("{env_var} not set"))
 }
 
 #[derive(Clone)]
@@ -73,7 +76,11 @@ impl State {
                 std::env::var("DICTATE_LANG").unwrap_or_else(|_| "multi".to_string())
             });
 
-        let model = std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "nova-3".to_string());
+        let model = fs::read_to_string(&config.model_file)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| {
+                std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "deepgram/nova-3".to_string())
+            });
 
         let mode = fs::read_to_string(&config.mode_file)
             .map(|s| s.trim().to_string())

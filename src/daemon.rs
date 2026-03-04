@@ -5,9 +5,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::audio;
-use crate::config::{Config, State};
+use crate::config::{self, Config, State};
 use crate::deepgram;
+use crate::fireworks;
 use crate::fnkey;
+use crate::groq;
 use crate::ipc;
 use crate::output;
 use crate::overlay;
@@ -58,24 +60,47 @@ impl DaemonState {
         let stop = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop.clone());
 
+        let (provider, _model) = config::parse_provider_model(&self.state.model);
+        let provider = provider.to_string();
+
         match self.state.mode.as_str() {
-            "live" => self.start_live(stop)?,
-            "batch" => self.start_batch(stop)?,
-            "vad" => self.start_vad(stop)?,
-            _ => self.start_live(stop)?,
+            "live" => {
+                if provider == "groq" {
+                    tracing::info!("groq doesn't support live streaming, falling back to deepgram/nova-3");
+                    let saved = self.state.model.clone();
+                    self.state.model = "deepgram/nova-3".into();
+                    let result = self.start_live(stop, "deepgram");
+                    self.state.model = saved;
+                    result?;
+                } else {
+                    self.start_live(stop, &provider)?;
+                }
+            }
+            "batch" => self.start_batch(stop, &provider)?,
+            "vad" => self.start_vad(stop, &provider)?,
+            _ => self.start_live(stop, &provider)?,
         }
 
-        Ok(format!("recording ({})", self.state.mode))
+        Ok(format!("recording ({}, {})", self.state.mode, provider))
     }
 
-    fn start_live(&mut self, stop: Arc<AtomicBool>) -> Result<()> {
+    fn start_live(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
         let (stream, audio_rx, sample_rate) = audio::capture_to_channel(stop.clone())?;
         self._audio_stream = Some(stream);
 
         let state = self.state.clone();
         let overlay = self.overlay.clone();
+        let provider = provider.to_string();
         self.record_handle = Some(tokio::spawn(async move {
-            if let Err(e) = deepgram::stream_live(&state, audio_rx, stop, sample_rate, overlay).await {
+            let result = match provider.as_str() {
+                "fireworks" => {
+                    fireworks::stream_live(&state, audio_rx, stop, sample_rate, overlay).await
+                }
+                _ => {
+                    deepgram::stream_live(&state, audio_rx, stop, sample_rate, overlay).await
+                }
+            };
+            if let Err(e) = result {
                 tracing::error!("live streaming error: {e}");
             }
         }));
@@ -83,20 +108,19 @@ impl DaemonState {
         Ok(())
     }
 
-    fn start_batch(&mut self, stop: Arc<AtomicBool>) -> Result<()> {
+    fn start_batch(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
         let audio_file = self.config.audio_file.clone();
         let state = self.state.clone();
         let transcript_file = self.config.transcript_file.clone();
+        let provider = provider.to_string();
 
         self.record_handle = Some(tokio::spawn(async move {
-            // Record in a blocking thread
             let audio_file2 = audio_file.clone();
             let stop2 = stop.clone();
             let record = tokio::task::spawn_blocking(move || {
                 audio::record_to_file(&audio_file2, stop2)
             });
 
-            // Wait for stop signal
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -106,8 +130,14 @@ impl DaemonState {
                 return;
             }
 
-            // Transcribe
-            match deepgram::transcribe_file(&audio_file, &state.lang, &state.model).await {
+            let (_, model) = config::parse_provider_model(&state.model);
+            let result = match provider.as_str() {
+                "groq" => groq::transcribe_file(&audio_file, &state.lang, model).await,
+                "fireworks" => fireworks::transcribe_file(&audio_file, &state.lang, model).await,
+                _ => deepgram::transcribe_file(&audio_file, &state.lang, model).await,
+            };
+
+            match result {
                 Ok(transcript) if !transcript.is_empty() => {
                     if state.output == "clipboard" {
                         output::copy_to_clipboard(&transcript);
@@ -127,10 +157,11 @@ impl DaemonState {
         Ok(())
     }
 
-    fn start_vad(&mut self, stop: Arc<AtomicBool>) -> Result<()> {
+    fn start_vad(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
         let audio_file = self.config.audio_file.with_extension("chunk.wav");
         let state = self.state.clone();
         let transcript_file = self.config.transcript_file.clone();
+        let provider = provider.to_string();
 
         self.record_handle = Some(tokio::spawn(async move {
             let mut full_transcript = String::new();
@@ -157,7 +188,16 @@ impl DaemonState {
                     continue;
                 }
 
-                match deepgram::transcribe_file(&audio_file, &state.lang, &state.model).await {
+                let (_, model) = config::parse_provider_model(&state.model);
+                let result = match provider.as_str() {
+                    "groq" => groq::transcribe_file(&audio_file, &state.lang, model).await,
+                    "fireworks" => {
+                        fireworks::transcribe_file(&audio_file, &state.lang, model).await
+                    }
+                    _ => deepgram::transcribe_file(&audio_file, &state.lang, model).await,
+                };
+
+                match result {
                     Ok(transcript) if !transcript.is_empty() => {
                         if state.output == "clipboard" {
                             full_transcript.push_str(&transcript);
@@ -194,7 +234,6 @@ impl DaemonState {
         }
         self._audio_stream = None;
 
-        // Give the record handle a moment to finish
         if let Some(handle) = self.record_handle.take() {
             let _ = tokio::spawn(async move {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
@@ -292,17 +331,39 @@ impl DaemonState {
                     ))
                 }
             }
+            "model" => {
+                if let Some(m) = req.arg {
+                    let (provider, model) = config::parse_provider_model(&m);
+                    if !config::PROVIDERS.contains(&provider) {
+                        return ipc::Response::err(format!(
+                            "unknown provider '{}'. use: {}",
+                            provider,
+                            config::PROVIDERS.join(", ")
+                        ));
+                    }
+                    if model.is_empty() {
+                        return ipc::Response::err("model name required after provider/");
+                    }
+                    let _ = fs::write(&self.config.model_file, &m);
+                    self.state.model = m.clone();
+                    ipc::Response::ok(format!("model: {}", m))
+                } else {
+                    ipc::Response::ok(format!(
+                        "model: {} (providers: {})",
+                        self.state.model,
+                        config::PROVIDERS.join(", ")
+                    ))
+                }
+            }
             other => ipc::Response::err(format!("unknown command: {}", other)),
         }
     }
 }
 
 pub async fn run() -> Result<()> {
-    // Spawn system tray
     let (tray_tx, mut tray_rx) = mpsc::channel::<()>(4);
     let tray_handle = tray::spawn(tray_tx).await?;
 
-    // Spawn Fn key watcher (evdev)
     let (fn_tx, mut fn_rx) = mpsc::channel::<fnkey::KeyEvent>(16);
     tokio::spawn(async move {
         if let Err(e) = fnkey::watch_fn_key(fn_tx).await {
@@ -313,7 +374,6 @@ pub async fn run() -> Result<()> {
     let config = Config::new();
     let state = State::load(&config);
 
-    // Spawn overlay
     let overlay_handle = overlay::spawn(state.font.clone())?;
 
     let mut daemon = DaemonState::new(tray_handle, overlay_handle);
@@ -325,14 +385,12 @@ pub async fn run() -> Result<()> {
         daemon.state.model
     );
 
-    // Clean up stale state
     let _ = fs::write(&daemon.config.state_file, "idle");
     let _ = fs::remove_file(&daemon.config.socket_path);
 
     let listener = ipc::bind(&daemon.config.socket_path)?;
     tracing::info!("IPC socket: {}", daemon.config.socket_path.display());
 
-    // Spawn IPC acceptor that forwards commands
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<(ipc::Request, tokio::sync::oneshot::Sender<ipc::Response>)>(16);
 
     tokio::spawn(async move {

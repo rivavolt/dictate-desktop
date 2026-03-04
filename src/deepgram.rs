@@ -36,11 +36,12 @@ pub async fn stream_live(
     sample_rate: u32,
     overlay: overlay::Handle,
 ) -> Result<()> {
-    let api_key = config::get_api_key()?;
+    let api_key = config::get_api_key("deepgram")?;
+    let (_, model) = config::parse_provider_model(&state.model);
 
     let params = format!(
         "model={}&language={}&encoding=linear16&sample_rate={}&channels=1&smart_format=true&interim_results=true&endpointing=300",
-        state.model, state.lang, sample_rate
+        model, state.lang, sample_rate
     );
     let ws_url = format!("wss://api.deepgram.com/v1/listen?{}", params);
 
@@ -55,7 +56,7 @@ pub async fn stream_live(
         .header("Authorization", format!("Token {}", api_key))
         .body(())?;
 
-    tracing::debug!("connecting to Deepgram (model: {}, lang: {})", state.model, state.lang);
+    tracing::debug!("connecting to Deepgram (model: {}, lang: {})", model, state.lang);
     let (ws_stream, _) = connect_async(request)
         .await
         .context("WebSocket connect failed")?;
@@ -137,7 +138,7 @@ pub async fn stream_live(
 }
 
 pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) -> Result<String> {
-    let api_key = config::get_api_key()?;
+    let api_key = config::get_api_key("deepgram")?;
     let url = format!(
         "https://api.deepgram.com/v1/listen?model={}&language={}&detect_language=true&smart_format=true",
         model, lang

@@ -26,7 +26,7 @@
             environmentFile = lib.mkOption {
               type = lib.types.nullOr lib.types.path;
               default = null;
-              description = "Path to environment file (DEEPGRAM_API_KEY)";
+              description = "Path to environment file with API keys for STT providers";
             };
           };
 

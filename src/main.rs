@@ -2,7 +2,9 @@ mod audio;
 mod config;
 mod daemon;
 mod deepgram;
+mod fireworks;
 mod fnkey;
+mod groq;
 mod ipc;
 mod output;
 mod overlay;
@@ -39,6 +41,8 @@ enum Commands {
     Output { output: Option<String> },
     /// Set or show overlay font (e.g. "Inter", "JetBrains Mono")
     Font { font: Option<String> },
+    /// Set or show model (provider/model). Providers: deepgram, groq, fireworks
+    Model { model: Option<String> },
 }
 
 #[tokio::main]
@@ -89,6 +93,10 @@ async fn main() -> Result<()> {
                 Commands::Font { font } => ipc::Request {
                     command: "font".into(),
                     arg: font,
+                },
+                Commands::Model { model } => ipc::Request {
+                    command: "model".into(),
+                    arg: model,
                 },
                 Commands::Daemon => unreachable!(),
             };

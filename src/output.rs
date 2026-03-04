@@ -1,9 +1,9 @@
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex, OnceLock};
 
-use wl_clipboard_rs::copy::{MimeType, Options, Source};
+use wl_clipboard_rs::copy::{MimeType, Options, ServeRequests, Source};
 use wrtype::WrtypeClient;
 
-static CLIENT: std::sync::OnceLock<Mutex<WrtypeClient>> = std::sync::OnceLock::new();
+static CLIENT: OnceLock<Mutex<WrtypeClient>> = OnceLock::new();
 
 fn get_client() -> &'static Mutex<WrtypeClient> {
     CLIENT.get_or_init(|| {
@@ -21,12 +21,24 @@ pub fn type_text(text: &str) {
     }
 }
 
+static CLIPBOARD_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+
+fn clipboard_sender() -> &'static mpsc::Sender<String> {
+    CLIPBOARD_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(text) = rx.recv() {
+                let mut opts = Options::new();
+                opts.serve_requests(ServeRequests::Only(1));
+                if let Err(e) = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text) {
+                    tracing::error!("clipboard copy failed: {e}");
+                }
+            }
+        });
+        tx
+    })
+}
+
 pub fn copy_to_clipboard(text: &str) {
-    let text = text.to_string();
-    std::thread::spawn(move || {
-        let opts = Options::new();
-        if let Err(e) = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text) {
-            tracing::error!("clipboard copy failed: {e}");
-        }
-    });
+    let _ = clipboard_sender().send(text.to_string());
 }
