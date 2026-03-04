@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1", features = ["full", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }

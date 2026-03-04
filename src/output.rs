@@ -36,20 +36,27 @@ pub fn append_history(path: &std::path::Path, text: &str) {
         return;
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{secs}] {text}");
+        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+        let _ = writeln!(f, "[{ts}] {text}");
     }
 }
 
 pub fn copy_to_clipboard(text: &str) {
-    let text = text.to_string();
-    std::thread::spawn(move || {
-        let opts = Options::new();
-        if let Err(e) = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text) {
-            tracing::error!("clipboard copy failed: {e}");
-        }
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("clipboard".into())
+            .spawn(move || {
+                while let Ok(text) = rx.recv() {
+                    let opts = Options::new();
+                    if let Err(e) = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text) {
+                        tracing::error!("clipboard copy failed: {e}");
+                    }
+                }
+            })
+            .expect("clipboard thread");
+        tx
     });
+    let _ = tx.send(text.to_string());
 }
