@@ -41,7 +41,7 @@
 
               serviceConfig = {
                 Environment = [
-                  "PATH=${lib.makeBinPath [ pkgs.wtype pkgs.wl-clipboard pkgs.pipewire pkgs.sox ]}"
+                  "PATH=${lib.makeBinPath [ pkgs.wl-clipboard pkgs.pipewire pkgs.sox ]}"
                   "XDG_RUNTIME_DIR=/run/user/%U"
                 ];
                 Type = "simple";
@@ -60,13 +60,20 @@
           };
         };
 
+      devShells = forAllSystems ({ pkgs }: {
+        default = pkgs.mkShell {
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.alsa-lib pkgs.openssl pkgs.libxkbcommon pkgs.wayland ];
+        };
+      });
+
       packages = forAllSystems ({ pkgs }: let
         craneLib = crane.mkLib pkgs;
       in {
         default = craneLib.buildPackage {
           src = craneLib.cleanCargoSource ./.;
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.alsa-lib pkgs.openssl ];
+          buildInputs = [ pkgs.alsa-lib pkgs.openssl pkgs.libxkbcommon pkgs.wayland ];
           meta = {
             description = "Voice-to-text dictation daemon";
             mainProgram = "dictate";

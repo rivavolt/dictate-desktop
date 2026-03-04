@@ -13,8 +13,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 cpal = "0.15"
 dirs = "5.0"
+evdev = { version = "0.12", features = ["tokio"] }
 hound = "3.5"
 reqwest = { version = "0.12", features = ["multipart"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ksni = "0.3.3"
+wrtype = "0.1"

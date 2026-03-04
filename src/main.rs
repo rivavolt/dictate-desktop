@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod daemon;
 mod deepgram;
+mod fnkey;
 mod ipc;
 mod output;
 mod sound;

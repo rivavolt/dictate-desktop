@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::audio;
 use crate::config::{Config, State};
 use crate::deepgram;
+use crate::fnkey;
 use crate::ipc;
 use crate::output;
 use crate::sound;
@@ -257,6 +258,14 @@ pub async fn run() -> Result<()> {
     let (tray_tx, mut tray_rx) = mpsc::channel::<()>(4);
     let tray_handle = tray::spawn(tray_tx).await?;
 
+    // Spawn Fn key watcher (evdev)
+    let (fn_tx, mut fn_rx) = mpsc::channel::<fnkey::KeyEvent>(16);
+    tokio::spawn(async move {
+        if let Err(e) = fnkey::watch_fn_key(fn_tx).await {
+            tracing::warn!("Fn key watcher failed: {e}");
+        }
+    });
+
     let mut daemon = DaemonState::new(tray_handle);
 
     tracing::info!(
@@ -300,6 +309,18 @@ pub async fn run() -> Result<()> {
             }
             Some(()) = tray_rx.recv() => {
                 let _ = daemon.toggle_recording();
+            }
+            Some(ev) = fn_rx.recv() => {
+                match ev {
+                    fnkey::KeyEvent::Start => {
+                        let _ = daemon.toggle_recording();
+                    }
+                    fnkey::KeyEvent::Release => {
+                        if daemon.recording {
+                            let _ = daemon.stop_recording();
+                        }
+                    }
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutting down");
