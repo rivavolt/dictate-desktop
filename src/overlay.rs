@@ -261,7 +261,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                         state.fade_target = 0.0;
                     } else {
                         state.shrink_target = 1.0;
-                        state.redraw();
+                        state.resize_and_redraw();
                     }
                 }
                 Command::SetFont(name) => {
@@ -533,6 +533,7 @@ impl State {
         };
 
         let h = PADDING_Y as u32 * 2 + num_lines * self.line_height as u32;
+        let h = if self.shrink_target > 0.5 { h.max(PILL_SIZE) } else { h };
         h.min(self.max_height)
     }
 
