@@ -22,7 +22,7 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-const PILL_SIZE: u32 = 44;
+const PILL_SIZE: u32 = 56;
 const PADDING_X: f32 = 16.0;
 const PADDING_Y: f32 = 8.0;
 const OVERLAY_WIDTH_FRAC: f64 = 0.618;
@@ -514,13 +514,11 @@ impl State {
             let widest = self.wrapped_lines.iter()
                 .map(|l| self.measure_text_width(l, font_sz))
                 .fold(0.0f32, f32::max);
-            (widest + PADDING_X * sf * 2.0)
-                .max(PILL_SIZE as f32 * sf)
-                .min(pw)
+            (widest + PADDING_X * sf * 2.0).min(pw)
         };
 
         let h = PADDING_Y as u32 * 2 + num_lines * self.line_height as u32;
-        h.max(PILL_SIZE).min(self.max_height)
+        h.min(self.max_height)
     }
 
     fn resize_and_redraw(&mut self) {
@@ -646,7 +644,7 @@ impl State {
         if show_pill {
             let cx = rx + rw / 2.0;
             let cy = ry + rh / 2.0;
-            let icon_s = rh * 0.4;
+            let icon_s = rh * 0.5;
             if is_recording_pill {
                 let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6;
                 let a = pulse * pill_alpha;
