@@ -150,13 +150,12 @@ pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) ->
     let api_key = config::get_api_key("deepgram")?;
     let api_lang = if lang == config::AUTO_LANG { "multi" } else { lang };
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model={}&language={}&detect_language=true&smart_format=true",
+        "https://api.deepgram.com/v1/listen?model={}&language={}&smart_format=true",
         model, api_lang
     );
 
     let audio_data = tokio::fs::read(path).await?;
-    let client = reqwest::Client::new();
-    let response = client
+    let response = config::http_client()
         .post(&url)
         .header("Authorization", format!("Token {}", api_key))
         .header("Content-Type", "audio/wav")
