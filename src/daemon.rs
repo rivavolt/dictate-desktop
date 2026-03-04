@@ -17,6 +17,34 @@ use crate::sound;
 use crate::transcript::TranscriptEvent;
 use crate::tray;
 
+async fn transcribe_with_retry(
+    path: &std::path::Path,
+    provider: &str,
+    lang: &str,
+    model: &str,
+) -> anyhow::Result<String> {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+            tracing::info!("retrying transcription (attempt {}/3, backoff {}ms)", attempt + 1, delay.as_millis());
+            tokio::time::sleep(delay).await;
+        }
+        match match provider {
+            "groq" => groq::transcribe_file(path, lang, model).await,
+            "fireworks" => fireworks::transcribe_file(path, lang, model).await,
+            _ => deepgram::transcribe_file(path, lang, model).await,
+        } {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                tracing::warn!("transcription attempt {} failed: {e}", attempt + 1);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
 struct DaemonState {
     config: Config,
     state: State,
@@ -182,19 +210,13 @@ impl DaemonState {
             }
 
             let (_, model) = config::parse_provider_model(&state.model);
-            let result = match provider.as_str() {
-                "groq" => groq::transcribe_file(&audio_file, &state.lang, model).await,
-                "fireworks" => fireworks::transcribe_file(&audio_file, &state.lang, model).await,
-                _ => deepgram::transcribe_file(&audio_file, &state.lang, model).await,
-            };
+            let result = transcribe_with_retry(&audio_file, &provider, &state.lang, model).await;
 
             match result {
                 Ok(transcript) if !transcript.is_empty() => {
-                    if state.output == "clipboard" {
-                        output::copy_to_clipboard(&transcript);
-                    } else {
+                    output::copy_to_clipboard(&transcript);
+                    if state.output != "clipboard" {
                         output::type_text(&transcript);
-                        output::copy_to_clipboard(&transcript);
                     }
                     let _ = fs::write(&transcript_file, &transcript);
                 }
@@ -240,13 +262,7 @@ impl DaemonState {
                 }
 
                 let (_, model) = config::parse_provider_model(&state.model);
-                let result = match provider.as_str() {
-                    "groq" => groq::transcribe_file(&audio_file, &state.lang, model).await,
-                    "fireworks" => {
-                        fireworks::transcribe_file(&audio_file, &state.lang, model).await
-                    }
-                    _ => deepgram::transcribe_file(&audio_file, &state.lang, model).await,
-                };
+                let result = transcribe_with_retry(&audio_file, &provider, &state.lang, model).await;
 
                 match result {
                     Ok(transcript) if !transcript.is_empty() => {
@@ -254,11 +270,9 @@ impl DaemonState {
                         if !full_transcript.ends_with(' ') {
                             full_transcript.push(' ');
                         }
-                        if state.output == "clipboard" {
-                            output::copy_to_clipboard(&full_transcript);
-                        } else {
+                        output::copy_to_clipboard(&full_transcript);
+                        if state.output != "clipboard" {
                             output::type_text(&transcript);
-                            output::copy_to_clipboard(&full_transcript);
                         }
                         let _ = fs::write(&transcript_file, &full_transcript);
                     }
