@@ -99,6 +99,8 @@ impl DaemonState {
         self.record_handle = Some(tokio::spawn(async move {
             let is_clipboard = output_mode == "clipboard";
             let event_handler = tokio::spawn(async move {
+                let mut last_accumulated = String::new();
+                let mut last_pending = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
                         TranscriptEvent::Final { delta, accumulated } => {
@@ -111,13 +113,32 @@ impl DaemonState {
                                 output::copy_to_clipboard(&accumulated);
                             }
                             let _ = std::fs::write(&transcript_file, &accumulated);
+                            last_accumulated = accumulated;
+                            last_pending.clear();
                         }
                         TranscriptEvent::Interim(text) => {
                             if is_clipboard {
-                                overlay_handle.set_pending(text);
+                                overlay_handle.set_pending(text.clone());
                             }
+                            last_pending = text;
                         }
                     }
+                }
+                // Flush any pending text that never got finalized
+                if !last_pending.is_empty() {
+                    if !last_accumulated.is_empty() && !last_accumulated.ends_with(' ') {
+                        last_accumulated.push(' ');
+                    }
+                    last_accumulated.push_str(&last_pending);
+                    tracing::info!("transcript (flushed pending): {last_pending}");
+                    if is_clipboard {
+                        output::copy_to_clipboard(&last_accumulated);
+                        overlay_handle.set_text(last_accumulated.clone());
+                    } else {
+                        output::type_text(&last_pending);
+                        output::copy_to_clipboard(&last_accumulated);
+                    }
+                    let _ = std::fs::write(&transcript_file, &last_accumulated);
                 }
                 if is_clipboard {
                     overlay_handle.copied();
