@@ -488,13 +488,12 @@ impl State {
                 Metrics::new(self.font_size * sf, self.line_height * sf),
             );
 
-            // Pending text: softer opacity pulse (40-70%)
-            let pending_opacity = if self.pending.is_empty() {
+            // Pending text: softer opacity pulse (30-60%)
+            let pending_alpha = if self.pending.is_empty() {
                 0
             } else {
-                let pulse = self.anim_phase.sin() * 0.5 + 0.5; // 0.0 - 1.0
-                let alpha = (0.4 + pulse * 0.3) * text_alpha as f32; // 40-70% of text_alpha
-                alpha as u8
+                let pulse = self.anim_phase.sin() * 0.5 + 0.5;
+                ((0.3 + pulse * 0.3) * text_alpha as f32) as u8
             };
 
             self.text_buffer.set_rich_text(
@@ -504,7 +503,7 @@ impl State {
                         Color::rgba(0xFF, 0xFF, 0xFF, text_alpha)
                     )),
                     (pending_str.as_str(), Attrs::new().family(font_family).color(
-                        Color::rgba(0xCC, 0xCC, 0xCC, pending_opacity)
+                        Color::rgba(0x88, 0x88, 0xAA, pending_alpha)
                     )),
                 ],
                 &Attrs::new().family(font_family),

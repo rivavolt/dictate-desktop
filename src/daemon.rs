@@ -354,10 +354,10 @@ impl DaemonState {
                     self.state.model = m.clone();
                     ipc::Response::ok(format!("model: {}", m))
                 } else {
+                    let models = config::all_models().join(", ");
                     ipc::Response::ok(format!(
-                        "model: {} (providers: {})",
-                        self.state.model,
-                        config::PROVIDERS.join(", ")
+                        "model: {}\navailable: {}",
+                        self.state.model, models
                     ))
                 }
             }

@@ -4,6 +4,21 @@ use std::path::PathBuf;
 
 pub const PROVIDERS: &[&str] = &["deepgram", "groq", "fireworks"];
 
+pub fn provider_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "deepgram" => &["nova-3", "nova-2", "nova-2-general", "whisper-large", "whisper-medium", "whisper-small", "whisper-tiny"],
+        "groq" => &["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"],
+        "fireworks" => &["fireworks-asr-large", "whisper-v3-turbo", "whisper-v3"],
+        _ => &[],
+    }
+}
+
+pub fn all_models() -> Vec<String> {
+    PROVIDERS.iter().flat_map(|p| {
+        provider_models(p).iter().map(move |m| format!("{p}/{m}"))
+    }).collect()
+}
+
 pub struct Config {
     pub state_file: PathBuf,
     pub transcript_file: PathBuf,
