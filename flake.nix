@@ -41,7 +41,7 @@
 
               serviceConfig = {
                 Environment = [
-                  "PATH=${lib.makeBinPath [ pkgs.wl-clipboard pkgs.pipewire pkgs.sox ]}"
+                  "PATH=${lib.makeBinPath [ pkgs.pipewire pkgs.sox ]}"
                   "XDG_RUNTIME_DIR=/run/user/%U"
                 ];
                 Type = "simple";
@@ -62,8 +62,9 @@
 
       devShells = forAllSystems ({ pkgs }: {
         default = pkgs.mkShell {
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.mold ];
           buildInputs = [ pkgs.alsa-lib pkgs.openssl pkgs.libxkbcommon pkgs.wayland ];
+          RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
       });
 
