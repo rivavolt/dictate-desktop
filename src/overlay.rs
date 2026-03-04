@@ -32,9 +32,10 @@ const DOT_RADIUS: f32 = 4.0;
 
 pub enum Command {
     Show,
-    Hide,
     SetText(String),
     SetPending(String),
+    Processing,
+    Copied,
 }
 
 #[derive(Clone)]
@@ -47,16 +48,20 @@ impl Handle {
         let _ = self.tx.send(Command::Show);
     }
 
-    pub fn hide(&self) {
-        let _ = self.tx.send(Command::Hide);
-    }
-
     pub fn set_text(&self, text: String) {
         let _ = self.tx.send(Command::SetText(text));
     }
 
     pub fn set_pending(&self, text: String) {
         let _ = self.tx.send(Command::SetPending(text));
+    }
+
+    pub fn processing(&self) {
+        let _ = self.tx.send(Command::Processing);
+    }
+
+    pub fn copied(&self) {
+        let _ = self.tx.send(Command::Copied);
     }
 }
 
@@ -132,6 +137,8 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
         text: String::new(),
         pending: String::new(),
         listening: false,
+        processing: false,
+        copied_countdown: 0.0,
         anim_phase: 0.0,
         fade_alpha: 0.0,
         fade_target: 0.0,
@@ -174,8 +181,18 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                 needs_redraw = true;
             }
 
-            // Pulse animation for pending text and listening dot
-            if state.visible && (state.listening || !state.pending.is_empty()) {
+            // Copied countdown → trigger fade
+            if state.copied_countdown > 0.0 {
+                state.copied_countdown -= state.frame_ms as f32 / 1000.0;
+                if state.copied_countdown <= 0.0 {
+                    state.copied_countdown = 0.0;
+                    state.fade_target = 0.0;
+                }
+                needs_redraw = true;
+            }
+
+            // Pulse/spin animation for listening dot, processing spinner, pending text
+            if state.visible && (state.listening || state.processing || !state.pending.is_empty()) {
                 state.anim_phase += std::f32::consts::TAU * state.frame_ms as f32 / 1500.0;
                 needs_redraw = true;
             }
@@ -193,17 +210,16 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                 Command::Show => {
                     state.visible = true;
                     state.listening = true;
+                    state.processing = false;
+                    state.copied_countdown = 0.0;
                     state.text.clear();
                     state.pending.clear();
                     state.fade_target = 1.0;
                     state.resize_and_redraw();
                 }
-                Command::Hide => {
-                    state.listening = false;
-                    state.fade_target = 0.0;
-                }
                 Command::SetText(text) => {
                     state.listening = false;
+                    state.processing = false;
                     state.text = text;
                     state.pending.clear();
                     if state.visible {
@@ -214,6 +230,24 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                     state.listening = false;
                     state.pending = text;
                     if state.visible {
+                        state.resize_and_redraw();
+                    }
+                }
+                Command::Processing => {
+                    state.listening = false;
+                    state.processing = true;
+                    state.copied_countdown = 0.0;
+                    if state.visible {
+                        state.resize_and_redraw();
+                    }
+                }
+                Command::Copied => {
+                    state.processing = false;
+                    state.listening = false;
+                    if state.text.is_empty() {
+                        state.fade_target = 0.0;
+                    } else {
+                        state.copied_countdown = 1.5;
                         state.resize_and_redraw();
                     }
                 }
@@ -241,6 +275,8 @@ struct State {
     text: String,
     pending: String,
     listening: bool,
+    processing: bool,
+    copied_countdown: f32,
     anim_phase: f32,
     fade_alpha: f32,
     fade_target: f32,
@@ -270,6 +306,9 @@ impl State {
 
     fn display_text(&self) -> String {
         if self.listening {
+            return String::new();
+        }
+        if self.processing && self.text.is_empty() && self.pending.is_empty() {
             return String::new();
         }
         let mut full = self.text.clone();
@@ -399,25 +438,51 @@ impl State {
 
         let text_alpha = (0xFF as f32 * self.fade_alpha) as u8;
 
-        if self.listening {
-            // Pulsing red dot + "Listening..."
+        let compact_pill = self.listening
+            || (self.processing && self.text.is_empty() && self.pending.is_empty());
+
+        if compact_pill {
             let dot_r = DOT_RADIUS * sf;
-            let dot_x = PADDING_X as f32 * sf + dot_r;
-            let dot_y = ph as f32 / 2.0;
-            let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6; // 0.6 - 1.0
-            let dot_alpha = (pulse * text_alpha as f32) as u8;
+            let ind_x = PADDING_X as f32 * sf + dot_r;
+            let ind_y = ph as f32 / 2.0;
 
-            let dot_path = {
-                let mut pb = tiny_skia::PathBuilder::new();
-                pb.push_circle(dot_x, dot_y, dot_r);
-                pb.finish().unwrap()
-            };
-            let mut dot_paint = tiny_skia::Paint::default();
-            dot_paint.set_color(tiny_skia::Color::from_rgba8(0xE0, 0x40, 0x40, dot_alpha));
-            dot_paint.anti_alias = true;
-            pixmap.fill_path(&dot_path, &dot_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+            if self.listening {
+                // Pulsing red dot
+                let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6;
+                let dot_alpha = (pulse * text_alpha as f32) as u8;
+                let dot_path = {
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    pb.push_circle(ind_x, ind_y, dot_r);
+                    pb.finish().unwrap()
+                };
+                let mut dot_paint = tiny_skia::Paint::default();
+                dot_paint.set_color(tiny_skia::Color::from_rgba8(0xE0, 0x40, 0x40, dot_alpha));
+                dot_paint.anti_alias = true;
+                pixmap.fill_path(&dot_path, &dot_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+            } else {
+                // Spinning arc for processing
+                let segments = 24;
+                let sweep = std::f32::consts::TAU * 0.75;
+                let arc_path = {
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    for i in 0..=segments {
+                        let angle = self.anim_phase + sweep * i as f32 / segments as f32;
+                        let px = ind_x + dot_r * angle.cos();
+                        let py = ind_y + dot_r * angle.sin();
+                        if i == 0 { pb.move_to(px, py); } else { pb.line_to(px, py); }
+                    }
+                    pb.finish().unwrap()
+                };
+                let mut arc_paint = tiny_skia::Paint::default();
+                arc_paint.set_color(tiny_skia::Color::from_rgba8(0x88, 0x88, 0xCC, text_alpha));
+                arc_paint.anti_alias = true;
+                let mut arc_stroke = tiny_skia::Stroke::default();
+                arc_stroke.width = 1.5 * sf;
+                arc_stroke.line_cap = tiny_skia::LineCap::Round;
+                pixmap.stroke_path(&arc_path, &arc_paint, &arc_stroke, tiny_skia::Transform::identity(), None);
+            }
 
-            // "Listening..." text
+            let label = if self.listening { "Listening..." } else { "Processing..." };
             let font_family = Family::Name(&self.font_name);
             self.text_buffer.set_metrics(
                 &mut self.font_system,
@@ -425,7 +490,7 @@ impl State {
             );
             self.text_buffer.set_text(
                 &mut self.font_system,
-                "Listening...",
+                label,
                 &Attrs::new().family(font_family),
                 Shaping::Advanced,
             );

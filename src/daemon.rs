@@ -199,14 +199,14 @@ impl DaemonState {
 
                 match result {
                     Ok(transcript) if !transcript.is_empty() => {
-                        if state.output == "clipboard" {
-                            full_transcript.push_str(&transcript);
+                        full_transcript.push_str(&transcript);
+                        if !full_transcript.ends_with(' ') {
                             full_transcript.push(' ');
+                        }
+                        if state.output == "clipboard" {
                             output::copy_to_clipboard(&full_transcript);
                         } else {
                             output::type_text(&transcript);
-                            full_transcript.push_str(&transcript);
-                            full_transcript.push(' ');
                             output::copy_to_clipboard(&full_transcript);
                         }
                         let _ = fs::write(&transcript_file, &full_transcript);
@@ -234,9 +234,18 @@ impl DaemonState {
         }
         self._audio_stream = None;
 
+        if self.state.output == "clipboard" {
+            self.overlay.processing();
+        }
+
         if let Some(handle) = self.record_handle.take() {
-            let _ = tokio::spawn(async move {
+            let overlay = self.overlay.clone();
+            let is_clipboard = self.state.output == "clipboard";
+            tokio::spawn(async move {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+                if is_clipboard {
+                    overlay.copied();
+                }
             });
         }
 
@@ -245,9 +254,6 @@ impl DaemonState {
         sound::play_stop();
         let tray = self.tray_handle.clone();
         tokio::spawn(async move { tray.update(|t| t.set_recording(false)).await; });
-        if self.state.output == "clipboard" {
-            self.overlay.hide();
-        }
 
         Ok("stopped".into())
     }
@@ -354,10 +360,12 @@ impl DaemonState {
                     self.state.model = m.clone();
                     ipc::Response::ok(format!("model: {}", m))
                 } else {
-                    let models = config::all_models().join(", ");
+                    let mut models = config::all_models();
+                    models.sort();
+                    let list = models.iter().map(|m| format!("  {m}")).collect::<Vec<_>>().join("\n");
                     ipc::Response::ok(format!(
-                        "model: {}\navailable: {}",
-                        self.state.model, models
+                        "model: {}\navailable:\n{}",
+                        self.state.model, list
                     ))
                 }
             }

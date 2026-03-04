@@ -87,6 +87,7 @@ pub async fn stream_live(
 
     let receiver_task = tokio::spawn(async move {
         let mut prev_final_text = String::new();
+        let mut last_pending = String::new();
 
         while let Some(Ok(msg)) = ws_rx.next().await {
             let Message::Text(text) = msg else {
@@ -101,11 +102,10 @@ pub async fn stream_live(
                 break;
             }
 
-            if resp.checkpoint_id.as_deref() == Some("final") {
-                break;
-            }
+            let is_final_checkpoint = resp.checkpoint_id.as_deref() == Some("final");
 
             let Some(words) = resp.words else {
+                if is_final_checkpoint { break; }
                 continue;
             };
 
@@ -124,6 +124,13 @@ pub async fn stream_live(
                     }
                     pending_words.push_str(&w.word);
                 }
+            }
+
+            // On final checkpoint, treat remaining pending words as confirmed
+            if is_final_checkpoint && !pending_words.is_empty() {
+                if !final_words.is_empty() { final_words.push(' '); }
+                final_words.push_str(&pending_words);
+                pending_words.clear();
             }
 
             // When final text grows, emit the new portion
@@ -145,10 +152,27 @@ pub async fn stream_live(
 
             // Show pending words as interim
             if !pending_words.is_empty() && output_mode == "clipboard" {
-                overlay_handle.set_pending(pending_words);
+                overlay_handle.set_pending(pending_words.clone());
             }
+            last_pending = pending_words;
+
+            if is_final_checkpoint { break; }
         }
 
+        // Flush any pending words that were never finalized
+        if !last_pending.is_empty() {
+            if !prev_final_text.is_empty() { prev_final_text.push(' '); }
+            prev_final_text.push_str(&last_pending);
+            tracing::info!("transcript (flushed): {last_pending}");
+            if output_mode == "clipboard" {
+                output::copy_to_clipboard(&prev_final_text);
+                overlay_handle.set_text(prev_final_text.clone());
+            } else {
+                output::type_text(&last_pending);
+                output::copy_to_clipboard(&prev_final_text);
+            }
+            let _ = std::fs::write(&transcript_file, &prev_final_text);
+        }
     });
 
     while !stop.load(Ordering::Relaxed) {

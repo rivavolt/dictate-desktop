@@ -76,6 +76,10 @@ pub async fn stream_live(
                 _ => {}
             }
         }
+        // Signal Deepgram to flush remaining audio and send final results
+        let _ = ws_tx
+            .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
+            .await;
     });
 
     let cfg = config::Config::new();
@@ -108,7 +112,9 @@ pub async fn stream_live(
             if resp.is_final.unwrap_or(false) {
                 tracing::info!("transcript: {}", alt.transcript);
                 full_transcript.push_str(&alt.transcript);
-                full_transcript.push(' ');
+                if !full_transcript.ends_with(' ') {
+                    full_transcript.push(' ');
+                }
                 if output_mode == "clipboard" {
                     output::copy_to_clipboard(&full_transcript);
                     overlay_handle.set_text(full_transcript.clone());

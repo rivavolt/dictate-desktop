@@ -14,7 +14,8 @@ fn get_client() -> &'static Mutex<WrtypeClient> {
 pub fn type_text(text: &str) {
     if !text.is_empty() {
         if let Ok(mut client) = get_client().lock() {
-            if let Err(e) = client.type_text(&format!("{} ", text)) {
+            let out = if text.ends_with(' ') { text.to_string() } else { format!("{} ", text) };
+            if let Err(e) = client.type_text(&out) {
                 tracing::error!("type_text failed: {e}");
             }
         }
