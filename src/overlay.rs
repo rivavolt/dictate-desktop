@@ -110,7 +110,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
     );
 
     layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, PILL_SIZE);
+    layer.set_size(1, 1);
     layer.set_exclusive_zone(0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
@@ -194,7 +194,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
         configured: false,
         screen_width: 0,
         width: 0,
-        height: PILL_SIZE,
+        height: 1,
         max_height: 400,
         font_size: 16.0,
         line_height: 24.0,
@@ -570,8 +570,8 @@ impl State {
             self.egl_lib.swap_buffers(self.egl_display, self.egl_surface).ok();
             if self.visible {
                 self.visible = false;
-                self.height = PILL_SIZE;
-                self.layer.set_size(0, PILL_SIZE);
+                self.height = 1;
+                self.layer.set_size(1, 1);
             }
             return;
         }
