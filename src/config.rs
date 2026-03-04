@@ -4,6 +4,75 @@ use std::path::PathBuf;
 
 pub const PROVIDERS: &[&str] = &["deepgram", "groq", "fireworks"];
 
+pub const AUTO_LANG: &str = "auto";
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum LangSupport {
+    All,
+    EnglishOnly,
+}
+
+pub struct ModelCaps {
+    pub live: bool,
+    pub batch: bool,
+    pub lang: LangSupport,
+}
+
+pub fn model_caps(provider: &str, model: &str) -> ModelCaps {
+    match (provider, model) {
+        ("groq", _) => ModelCaps {
+            live: false,
+            batch: true,
+            lang: if model == "distil-whisper-large-v3-en" {
+                LangSupport::EnglishOnly
+            } else {
+                LangSupport::All
+            },
+        },
+        ("fireworks", "fireworks-asr-large") => ModelCaps {
+            live: true,
+            batch: true,
+            lang: LangSupport::All,
+        },
+        ("fireworks", _) => ModelCaps {
+            live: false,
+            batch: true,
+            lang: LangSupport::All,
+        },
+        _ => ModelCaps {
+            live: true,
+            batch: true,
+            lang: LangSupport::All,
+        },
+    }
+}
+
+/// Find best compatible model given mode/lang constraints. Returns None if current model is fine.
+pub fn resolve_model(current: &str, mode: &str, lang: &str) -> Option<String> {
+    let (provider, model) = parse_provider_model(current);
+
+    let needs_live = mode == "live";
+    let needs_multilang = lang != "en" && lang != "auto";
+
+    let compatible = |p: &str, m: &str| -> bool {
+        let c = model_caps(p, m);
+        (!needs_live || c.live) && (!needs_multilang || c.lang != LangSupport::EnglishOnly)
+    };
+
+    if compatible(provider, model) {
+        return None;
+    }
+
+    // same provider first
+    for m in provider_models(provider) {
+        if compatible(provider, m) {
+            return Some(format!("{provider}/{m}"));
+        }
+    }
+
+    Some("deepgram/nova-3".to_string())
+}
+
 pub fn provider_models(provider: &str) -> &'static [&'static str] {
     match provider {
         "deepgram" => &["nova-3", "nova-2", "nova-2-general", "whisper-large", "whisper-medium", "whisper-small", "whisper-tiny"],
@@ -85,11 +154,14 @@ pub struct State {
 
 impl State {
     pub fn load(config: &Config) -> Self {
-        let lang = fs::read_to_string(&config.lang_file)
+        let mut lang = fs::read_to_string(&config.lang_file)
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| {
-                std::env::var("DICTATE_LANG").unwrap_or_else(|_| "multi".to_string())
+                std::env::var("DICTATE_LANG").unwrap_or_else(|_| AUTO_LANG.to_string())
             });
+        if lang == "multi" {
+            lang = AUTO_LANG.to_string();
+        }
 
         let model = fs::read_to_string(&config.model_file)
             .map(|s| s.trim().to_string())

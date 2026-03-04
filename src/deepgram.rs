@@ -38,9 +38,10 @@ pub async fn stream_live(
     let api_key = config::get_api_key("deepgram")?;
     let (_, model) = config::parse_provider_model(&state.model);
 
+    let api_lang = if state.lang == config::AUTO_LANG { "multi" } else { &state.lang };
     let params = format!(
         "model={}&language={}&encoding=linear16&sample_rate={}&channels=1&smart_format=true&interim_results=true&endpointing=300",
-        model, state.lang, sample_rate
+        model, api_lang, sample_rate
     );
     let ws_url = format!("wss://api.deepgram.com/v1/listen?{}", params);
 
@@ -147,9 +148,10 @@ pub async fn stream_live(
 
 pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) -> Result<String> {
     let api_key = config::get_api_key("deepgram")?;
+    let api_lang = if lang == config::AUTO_LANG { "multi" } else { lang };
     let url = format!(
         "https://api.deepgram.com/v1/listen?model={}&language={}&detect_language=true&smart_format=true",
-        model, lang
+        model, api_lang
     );
 
     let audio_data = tokio::fs::read(path).await?;

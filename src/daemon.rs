@@ -61,21 +61,18 @@ impl DaemonState {
         let stop = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop.clone());
 
+        if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
+            tracing::info!("{} incompatible with mode={} lang={}, switching to {new_model}",
+                self.state.model, self.state.mode, self.state.lang);
+            self.state.model = new_model;
+            let _ = fs::write(&self.config.model_file, &self.state.model);
+        }
+
         let (provider, _model) = config::parse_provider_model(&self.state.model);
         let provider = provider.to_string();
 
         match self.state.mode.as_str() {
-            "live" => {
-                if provider == "groq" {
-                    tracing::info!("groq doesn't support live streaming, falling back to deepgram/nova-3");
-                    let saved = self.state.model.clone();
-                    let result = self.start_live(stop, "deepgram");
-                    self.state.model = saved;
-                    result?;
-                } else {
-                    self.start_live(stop, &provider)?;
-                }
-            }
+            "live" => self.start_live(stop, &provider)?,
             "batch" => self.start_batch(stop, &provider)?,
             "vad" => self.start_vad(stop, &provider)?,
             _ => self.start_live(stop, &provider)?,
@@ -336,7 +333,13 @@ impl DaemonState {
                     if ["live", "vad", "batch"].contains(&m.as_str()) {
                         let _ = fs::write(&self.config.mode_file, &m);
                         self.state.mode = m.clone();
-                        ipc::Response::ok(format!("mode: {}", m))
+                        let mut msg = format!("mode: {m}");
+                        if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
+                            self.state.model = new_model.clone();
+                            let _ = fs::write(&self.config.model_file, &self.state.model);
+                            msg.push_str(&format!(" (switched model to {new_model})"));
+                        }
+                        ipc::Response::ok(msg)
                     } else {
                         ipc::Response::err(format!("invalid mode '{}'. use: live, vad, batch", m))
                     }
@@ -349,9 +352,16 @@ impl DaemonState {
             }
             "lang" => {
                 if let Some(l) = req.arg {
-                    let _ = fs::write(&self.config.lang_file, &l);
-                    self.state.lang = l.clone();
-                    ipc::Response::ok(format!("language: {}", l))
+                    let lang = if l == "multi" { config::AUTO_LANG.to_string() } else { l };
+                    let _ = fs::write(&self.config.lang_file, &lang);
+                    self.state.lang = lang.clone();
+                    let mut msg = format!("language: {lang}");
+                    if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
+                        self.state.model = new_model.clone();
+                        let _ = fs::write(&self.config.model_file, &self.state.model);
+                        msg.push_str(&format!(" (switched model to {new_model})"));
+                    }
+                    ipc::Response::ok(msg)
                 } else {
                     ipc::Response::ok(format!("language: {}", self.state.lang))
                 }
@@ -400,13 +410,33 @@ impl DaemonState {
                     if model.is_empty() {
                         return ipc::Response::err("model name required after provider/");
                     }
+                    let caps = config::model_caps(provider, model);
+                    let mut warnings = Vec::new();
+                    if self.state.mode == "live" && !caps.live {
+                        warnings.push(format!("no live support, will resolve on record"));
+                    }
+                    if caps.lang == config::LangSupport::EnglishOnly && self.state.lang != "en" {
+                        warnings.push("english only".into());
+                    }
                     let _ = fs::write(&self.config.model_file, &m);
                     self.state.model = m.clone();
-                    ipc::Response::ok(format!("model: {}", m))
+                    let mut msg = format!("model: {m}");
+                    if !warnings.is_empty() {
+                        msg.push_str(&format!(" ({})", warnings.join(", ")));
+                    }
+                    ipc::Response::ok(msg)
                 } else {
-                    let mut models = config::all_models();
-                    models.sort();
-                    let list = models.iter().map(|m| format!("  {m}")).collect::<Vec<_>>().join("\n");
+                    let models = config::all_models();
+                    let list = models.iter().map(|m| {
+                        let (p, n) = config::parse_provider_model(m);
+                        let caps = config::model_caps(p, n);
+                        let mut tags = Vec::new();
+                        if caps.live { tags.push("live"); }
+                        if caps.batch { tags.push("batch"); }
+                        if caps.lang == config::LangSupport::EnglishOnly { tags.push("en-only"); }
+                        let current = if *m == self.state.model { " *" } else { "" };
+                        format!("  {m} [{tags}]{current}", tags = tags.join("+"))
+                    }).collect::<Vec<_>>().join("\n");
                     ipc::Response::ok(format!(
                         "model: {}\navailable:\n{}",
                         self.state.model, list

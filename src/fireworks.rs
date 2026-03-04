@@ -35,7 +35,7 @@ pub async fn stream_live(
     let (_, model) = config::parse_provider_model(&state.model);
 
     let mut params = vec![format!("model={model}")];
-    if !state.lang.is_empty() && state.lang != "multi" {
+    if !state.lang.is_empty() && state.lang != config::AUTO_LANG {
         params.push(format!("language={}", state.lang));
     }
     let query = params.join("&");
@@ -197,7 +197,7 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
         .text("model", model.to_string())
         .text("response_format", "json");
 
-    if !lang.is_empty() && lang != "multi" {
+    if !lang.is_empty() && lang != config::AUTO_LANG {
         form = form.text("language", lang.to_string());
     }
 

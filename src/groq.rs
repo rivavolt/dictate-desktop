@@ -22,7 +22,7 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
         .text("model", model.to_string())
         .text("response_format", "json");
 
-    if !lang.is_empty() && lang != "multi" {
+    if !lang.is_empty() && lang != config::AUTO_LANG {
         form = form.text("language", lang.to_string());
     }
 
