@@ -9,6 +9,7 @@ pub struct Config {
     pub lang_file: PathBuf,
     pub mode_file: PathBuf,
     pub output_file: PathBuf,
+    pub font_file: PathBuf,
     pub socket_path: PathBuf,
 }
 
@@ -29,6 +30,7 @@ impl Config {
             lang_file: state_dir.join("language"),
             mode_file: state_dir.join("mode"),
             output_file: state_dir.join("output"),
+            font_file: state_dir.join("font"),
             socket_path: runtime_dir.join("dictate.sock"),
         }
     }
@@ -60,6 +62,7 @@ pub struct State {
     pub model: String,
     pub mode: String,
     pub output: String,
+    pub font: String,
 }
 
 impl State {
@@ -80,6 +83,12 @@ impl State {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "type".to_string());
 
-        Self { lang, model, mode, output }
+        let font = fs::read_to_string(&config.font_file)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| {
+                std::env::var("DICTATE_FONT").unwrap_or_else(|_| "Inter".to_string())
+            });
+
+        Self { lang, model, mode, output, font }
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -21,15 +21,17 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-const BAR_HEIGHT: u32 = 48;
-const FONT_SIZE: f32 = 16.0;
-const LINE_HEIGHT: f32 = 20.0;
+const MIN_HEIGHT: u32 = 36;
 const PADDING_X: i32 = 16;
+const PADDING_Y: i32 = 8;
+const OVERLAY_WIDTH_FRAC: f64 = 0.618;
+const CHAR_WIDTH_RATIO: f32 = 0.47; // average char width / font_size for proportional fonts
 
 pub enum Command {
     Show,
     Hide,
     SetText(String),
+    SetPending(String),
     Shutdown,
 }
 
@@ -50,16 +52,20 @@ impl Handle {
     pub fn set_text(&self, text: String) {
         let _ = self.tx.send(Command::SetText(text));
     }
+
+    pub fn set_pending(&self, text: String) {
+        let _ = self.tx.send(Command::SetPending(text));
+    }
 }
 
-pub fn spawn() -> Result<Handle> {
+pub fn spawn(font: String) -> Result<Handle> {
     let (tx, rx) = calloop::channel::channel::<Command>();
     let handle = Handle { tx };
 
     std::thread::Builder::new()
         .name("overlay".into())
         .spawn(move || {
-            if let Err(e) = run(rx) {
+            if let Err(e) = run(rx, &font) {
                 tracing::error!("overlay thread: {e}");
             }
         })?;
@@ -67,7 +73,22 @@ pub fn spawn() -> Result<Handle> {
     Ok(handle)
 }
 
-fn run(cmd_rx: calloop::channel::Channel<Command>) -> Result<()> {
+fn blend_over(
+    dst: tiny_skia::PremultipliedColorU8,
+    src: tiny_skia::PremultipliedColorU8,
+) -> tiny_skia::PremultipliedColorU8 {
+    let sa = src.alpha() as u32;
+    let inv = 255 - sa;
+    tiny_skia::PremultipliedColorU8::from_rgba(
+        ((src.red() as u32 * 255 + dst.red() as u32 * inv) / 255) as u8,
+        ((src.green() as u32 * 255 + dst.green() as u32 * inv) / 255) as u8,
+        ((src.blue() as u32 * 255 + dst.blue() as u32 * inv) / 255) as u8,
+        ((sa * 255 + dst.alpha() as u32 * inv) / 255) as u8,
+    )
+    .unwrap()
+}
+
+fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -86,7 +107,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>) -> Result<()> {
     );
 
     layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, BAR_HEIGHT);
+    layer.set_size(0, MIN_HEIGHT);
     layer.set_exclusive_zone(0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
@@ -94,7 +115,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>) -> Result<()> {
     let pool = SlotPool::new(256, &shm)?;
     let mut font_system = FontSystem::new();
     let swash_cache = SwashCache::new();
-    let text_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let text_buffer = Buffer::new(&mut font_system, Metrics::new(16.0, 24.0));
 
     let mut state = State {
         registry_state: RegistryState::new(&globals),
@@ -105,11 +126,20 @@ fn run(cmd_rx: calloop::channel::Channel<Command>) -> Result<()> {
         font_system,
         swash_cache,
         text_buffer,
+        font_name: font_name.to_string(),
         text: String::new(),
+        pending: String::new(),
+        anim_phase: 0.0,
         visible: false,
         configured: false,
+        screen_width: 0,
         width: 0,
-        height: BAR_HEIGHT,
+        height: MIN_HEIGHT,
+        max_height: 400,
+        font_size: 16.0,
+        line_height: 24.0,
+        scale: 1,
+        frame_ms: 16,
         exit: false,
     };
 
@@ -123,22 +153,42 @@ fn run(cmd_rx: calloop::channel::Channel<Command>) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("wayland source: {e}"))?;
 
+    let anim_timer = calloop::timer::Timer::immediate();
+    loop_handle
+        .insert_source(anim_timer, |_, _, state| {
+            if state.visible && !state.pending.is_empty() {
+                state.anim_phase += std::f32::consts::TAU * state.frame_ms as f32 / 1500.0;
+                state.redraw();
+            }
+            calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_millis(state.frame_ms))
+        })
+        .map_err(|e| anyhow::anyhow!("anim timer: {e}"))?;
+
     loop_handle.insert_source(cmd_rx, |event, _, state| {
         if let calloop::channel::Event::Msg(cmd) = event {
             match cmd {
                 Command::Show => {
                     state.visible = true;
                     state.text = "Recording...".into();
-                    state.redraw();
+                    state.resize_and_redraw();
                 }
                 Command::Hide => {
                     state.visible = false;
+                    state.height = MIN_HEIGHT;
+                    state.layer.set_size(0, MIN_HEIGHT);
                     state.redraw();
                 }
                 Command::SetText(text) => {
                     state.text = text;
+                    state.pending.clear();
                     if state.visible {
-                        state.redraw();
+                        state.resize_and_redraw();
+                    }
+                }
+                Command::SetPending(text) => {
+                    state.pending = text;
+                    if state.visible {
+                        state.resize_and_redraw();
                     }
                 }
                 Command::Shutdown => {
@@ -164,109 +214,201 @@ struct State {
     font_system: FontSystem,
     swash_cache: SwashCache,
     text_buffer: Buffer,
+    font_name: String,
     text: String,
+    pending: String,
+    anim_phase: f32,
     visible: bool,
     configured: bool,
+    screen_width: u32,
     width: u32,
     height: u32,
+    max_height: u32,
+    font_size: f32,
+    line_height: f32,
+    scale: i32,
+    frame_ms: u64,
     exit: bool,
 }
 
 impl State {
+    fn update_refresh(&mut self, output: &wl_output::WlOutput) {
+        if let Some(info) = self.output_state.info(output) {
+            if let Some(mode) = info.modes.iter().find(|m| m.current) {
+                if mode.refresh_rate > 0 {
+                    self.frame_ms = (1000 / (mode.refresh_rate / 1000) as u64).max(1);
+                }
+            }
+        }
+    }
+
+    fn display_text(&self) -> String {
+        let mut full = self.text.clone();
+        if !self.pending.is_empty() {
+            if !full.is_empty() && !full.ends_with(' ') {
+                full.push(' ');
+            }
+            full.push_str(&self.pending);
+        }
+        full
+    }
+
+    fn compute_height(&mut self) -> u32 {
+        let s = self.scale as f32;
+        let display = self.display_text();
+        let font_family = Family::Name(&self.font_name);
+        let pw = self.width * self.scale as u32;
+
+        self.text_buffer.set_metrics(
+            &mut self.font_system,
+            Metrics::new(self.font_size * s, self.line_height * s),
+        );
+        self.text_buffer.set_text(
+            &mut self.font_system,
+            &display,
+            &Attrs::new().family(font_family),
+            Shaping::Advanced,
+        );
+        self.text_buffer.set_size(
+            &mut self.font_system,
+            Some((pw as i32 - PADDING_X * self.scale * 2) as f32),
+            None,
+        );
+        self.text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
+        let lines = self.text_buffer.layout_runs().count().max(1) as u32;
+        let h = PADDING_Y as u32 * 2 + lines * self.line_height as u32;
+        h.max(MIN_HEIGHT).min(self.max_height)
+    }
+
+    fn resize_and_redraw(&mut self) {
+        if !self.configured || self.width == 0 {
+            return;
+        }
+        let h = self.compute_height();
+        if h != self.height {
+            self.height = h;
+            self.layer.set_size(0, h);
+        }
+        self.redraw();
+    }
+
     fn redraw(&mut self) {
         if self.width == 0 || !self.configured {
             return;
         }
 
-        let width = self.width;
-        let height = self.height;
-        let stride = width as i32 * 4;
+        let s = self.scale;
+        let sf = s as f32;
+        let pw = self.width * s as u32;
+        let ph = self.height * s as u32;
+        let stride = pw as i32 * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
         if !self.visible {
             canvas.fill(0);
         } else {
-            // Semi-transparent dark background (pre-multiplied ARGB)
-            let alpha: u32 = 0xCC;
-            let r = (0x1E * alpha) / 255;
-            let g = (0x1E * alpha) / 255;
-            let b = (0x2E * alpha) / 255;
-            let bg = (alpha << 24) | (r << 16) | (g << 8) | b;
-            let bg_bytes = bg.to_ne_bytes();
-            canvas
-                .chunks_exact_mut(4)
-                .for_each(|chunk| chunk.copy_from_slice(&bg_bytes));
+            let mut pixmap = tiny_skia::Pixmap::new(pw, ph).expect("pixmap");
 
-            // Render text
-            self.text_buffer.set_text(
+            // Semi-transparent black background
+            pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xB0));
+
+            let final_text = self.text.clone();
+            let pending_str = if self.pending.is_empty() {
+                String::new()
+            } else if self.text.is_empty() {
+                self.pending.clone()
+            } else {
+                format!(" {}", self.pending)
+            };
+            let font_family = Family::Name(&self.font_name);
+
+            self.text_buffer.set_metrics(
                 &mut self.font_system,
-                &self.text,
-                &Attrs::new(),
+                Metrics::new(self.font_size * sf, self.line_height * sf),
+            );
+            self.text_buffer.set_rich_text(
+                &mut self.font_system,
+                [
+                    (final_text.as_str(), Attrs::new().family(font_family)),
+                    (pending_str.as_str(), Attrs::new().family(font_family).color({
+                        let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0x88 as f32 + 0x33 as f32;
+                        let v = pulse as u8;
+                        Color::rgb(v, v, (v as u16 + 0x11).min(0xFF) as u8)
+                    })),
+                ],
+                &Attrs::new().family(font_family),
                 Shaping::Advanced,
+                None,
             );
             self.text_buffer.set_size(
                 &mut self.font_system,
-                Some((width as i32 - PADDING_X * 2) as f32),
-                Some(height as f32),
+                Some((pw as i32 - PADDING_X * s * 2) as f32),
+                None,
             );
             self.text_buffer
                 .shape_until_scroll(&mut self.font_system, false);
 
-            let cw = width as i32;
-            let ch = height as i32;
-            let pad_y = ((height as i32 - LINE_HEIGHT as i32) / 2).max(0);
+            // Scroll offset: show last lines that fit when text exceeds max height
+            let total_lines = self.text_buffer.layout_runs().count() as i32;
+            let total_text_h = total_lines as f32 * self.line_height * sf;
+            let visible_h = ph as f32 - (PADDING_Y * s * 2) as f32;
+            let scroll_y = (total_text_h - visible_h).max(0.0) as i32;
+
+            let cw = pw as i32;
+            let ch = ph as i32;
+            let pad_x = PADDING_X * s;
+            let text_h = total_text_h.min(visible_h) as i32;
+            let pad_y = (ch - text_h) - PADDING_Y * s;
+            let pixels = pixmap.pixels_mut();
 
             self.text_buffer.draw(
                 &mut self.font_system,
                 &mut self.swash_cache,
                 Color::rgb(0xFF, 0xFF, 0xFF),
                 |x, y, w, h, color| {
-                    let x = x + PADDING_X;
-                    let y = y + pad_y;
-                    let a = color.a() as u32;
+                    let x = x + pad_x;
+                    let y = y + pad_y - scroll_y;
+                    let a = color.a();
                     if a == 0 {
                         return;
                     }
-                    let pr = (color.r() as u32 * a) / 255;
-                    let pg = (color.g() as u32 * a) / 255;
-                    let pb = (color.b() as u32 * a) / 255;
-                    let pixel = ((a << 24) | (pr << 16) | (pg << 8) | pb).to_ne_bytes();
+                    let src = tiny_skia::PremultipliedColorU8::from_rgba(
+                        color.r(), color.g(), color.b(), a,
+                    ).unwrap();
 
                     for row in y..(y + h as i32).min(ch) {
-                        if row < 0 {
-                            continue;
-                        }
+                        if row < 0 { continue; }
                         for col in x..(x + w as i32).min(cw) {
-                            if col < 0 {
-                                continue;
-                            }
-                            let off = (row * cw + col) as usize * 4;
-                            if off + 4 <= canvas.len() {
-                                if a >= 255 {
-                                    canvas[off..off + 4].copy_from_slice(&pixel);
-                                } else {
-                                    let inv = 255 - a;
-                                    for i in 0..4 {
-                                        canvas[off + i] = ((pixel[i] as u32 * a
-                                            + canvas[off + i] as u32 * inv)
-                                            / 255)
-                                            as u8;
-                                    }
-                                }
+                            if col < 0 { continue; }
+                            let idx = (row * cw + col) as usize;
+                            if idx < pixels.len() {
+                                pixels[idx] = blend_over(pixels[idx], src);
                             }
                         }
                     }
                 },
             );
+
+            // Copy pixmap (RGBA) to canvas (ARGB)
+            let pixmap_data = pixmap.data();
+            for (chunk, rgba) in canvas.chunks_exact_mut(4).zip(pixmap_data.chunks_exact(4)) {
+                chunk[0] = rgba[2]; // B
+                chunk[1] = rgba[1]; // G
+                chunk[2] = rgba[0]; // R
+                chunk[3] = rgba[3]; // A
+            }
         }
 
+        self.layer.wl_surface().set_buffer_scale(s);
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, width as i32, height as i32);
+            .damage_buffer(0, 0, pw as i32, ph as i32);
         buffer.attach_to(self.layer.wl_surface()).expect("attach");
         self.layer.commit();
     }
@@ -274,8 +416,13 @@ impl State {
 
 impl CompositorHandler for State {
     fn scale_factor_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32,
-    ) {}
+        &mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        self.scale = new_factor;
+        surface.set_buffer_scale(new_factor);
+        self.redraw();
+    }
     fn transform_changed(
         &mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface,
         _: wl_output::Transform,
@@ -295,8 +442,12 @@ impl OutputHandler for State {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.update_refresh(&output);
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.update_refresh(&output);
+    }
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
@@ -309,8 +460,28 @@ impl LayerShellHandler for State {
         &mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface,
         configure: LayerSurfaceConfigure, _: u32,
     ) {
-        self.width = configure.new_size.0.max(1);
-        self.height = configure.new_size.1.max(BAR_HEIGHT);
+        let w = configure.new_size.0.max(1);
+
+        // First configure gives us screen width (anchored LEFT|RIGHT)
+        // Use it to compute overlay width, font size, and margins
+        if self.screen_width == 0 || w > self.width + 100 {
+            self.screen_width = w;
+            let overlay_w = (w as f64 * OVERLAY_WIDTH_FRAC) as u32;
+            let margin_h = ((w - overlay_w) / 2) as i32;
+            let margin_b = (w as f64 * 0.02) as i32;
+            let content_w = overlay_w as f32 - PADDING_X as f32 * 2.0;
+            self.font_size = content_w / (100.0 * CHAR_WIDTH_RATIO);
+            self.line_height = self.font_size * 1.5;
+            self.max_height = (overlay_w as f64 * OVERLAY_WIDTH_FRAC) as u32;
+            self.layer.set_margin(0, margin_h, margin_b, margin_h);
+            self.width = overlay_w;
+        } else {
+            self.width = w;
+        }
+
+        if configure.new_size.1 > 0 {
+            self.height = configure.new_size.1;
+        }
         self.configured = true;
         self.redraw();
     }

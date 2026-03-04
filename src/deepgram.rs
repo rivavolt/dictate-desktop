@@ -100,21 +100,25 @@ pub async fn stream_live(
             else {
                 continue;
             };
-            if alt.transcript.is_empty() || !resp.is_final.unwrap_or(false) {
+            if alt.transcript.is_empty() {
                 continue;
             }
 
-            tracing::info!("transcript: {}", alt.transcript);
-            full_transcript.push_str(&alt.transcript);
-            full_transcript.push(' ');
-            if output_mode == "clipboard" {
-                output::copy_to_clipboard(&full_transcript);
-                overlay_handle.set_text(full_transcript.clone());
-            } else {
-                output::type_text(&alt.transcript);
-                output::copy_to_clipboard(&full_transcript);
+            if resp.is_final.unwrap_or(false) {
+                tracing::info!("transcript: {}", alt.transcript);
+                full_transcript.push_str(&alt.transcript);
+                full_transcript.push(' ');
+                if output_mode == "clipboard" {
+                    output::copy_to_clipboard(&full_transcript);
+                    overlay_handle.set_text(full_transcript.clone());
+                } else {
+                    output::type_text(&alt.transcript);
+                    output::copy_to_clipboard(&full_transcript);
+                }
+                let _ = std::fs::write(&transcript_file, &full_transcript);
+            } else if output_mode == "clipboard" {
+                overlay_handle.set_pending(alt.transcript.clone());
             }
-            let _ = std::fs::write(&transcript_file, &full_transcript);
         }
     });
 

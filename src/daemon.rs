@@ -267,6 +267,15 @@ impl DaemonState {
                     ipc::Response::ok(format!("language: {}", self.state.lang))
                 }
             }
+            "font" => {
+                if let Some(f) = req.arg {
+                    let _ = fs::write(&self.config.font_file, &f);
+                    self.state.font = f.clone();
+                    ipc::Response::ok(format!("font: {} (restart daemon to apply)", f))
+                } else {
+                    ipc::Response::ok(format!("font: {}", self.state.font))
+                }
+            }
             "output" => {
                 if let Some(o) = req.arg {
                     if ["type", "clipboard"].contains(&o.as_str()) {
@@ -301,8 +310,11 @@ pub async fn run() -> Result<()> {
         }
     });
 
+    let config = Config::new();
+    let state = State::load(&config);
+
     // Spawn overlay
-    let overlay_handle = overlay::spawn()?;
+    let overlay_handle = overlay::spawn(state.font.clone())?;
 
     let mut daemon = DaemonState::new(tray_handle, overlay_handle);
 

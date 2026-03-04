@@ -37,6 +37,8 @@ enum Commands {
     Lang { lang: Option<String> },
     /// Set or show output method (type, clipboard)
     Output { output: Option<String> },
+    /// Set or show overlay font (e.g. "Inter", "JetBrains Mono")
+    Font { font: Option<String> },
 }
 
 #[tokio::main]
@@ -83,6 +85,10 @@ async fn main() -> Result<()> {
                 Commands::Output { output } => ipc::Request {
                     command: "output".into(),
                     arg: output,
+                },
+                Commands::Font { font } => ipc::Request {
+                    command: "font".into(),
+                    arg: font,
                 },
                 Commands::Daemon => unreachable!(),
             };
