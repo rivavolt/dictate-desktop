@@ -104,12 +104,11 @@ impl DaemonState {
                     match event {
                         TranscriptEvent::Final { delta, accumulated } => {
                             tracing::info!("transcript: {delta}");
+                            output::copy_to_clipboard(&accumulated);
                             if is_clipboard {
-                                output::copy_to_clipboard(&accumulated);
                                 overlay_handle.set_text(accumulated.clone());
                             } else {
                                 output::type_text(&delta);
-                                output::copy_to_clipboard(&accumulated);
                             }
                             let _ = std::fs::write(&transcript_file, &accumulated);
                             last_accumulated = accumulated;
