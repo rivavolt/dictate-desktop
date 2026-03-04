@@ -32,7 +32,6 @@ pub enum Command {
     Hide,
     SetText(String),
     SetPending(String),
-    Shutdown,
 }
 
 #[derive(Clone)]
@@ -186,13 +185,13 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str) -> Result<()
                     }
                 }
                 Command::SetPending(text) => {
+                    if state.text == "Recording..." {
+                        state.text.clear();
+                    }
                     state.pending = text;
                     if state.visible {
                         state.resize_and_redraw();
                     }
-                }
-                Command::Shutdown => {
-                    state.exit = true;
                 }
             }
         }
@@ -378,8 +377,12 @@ impl State {
                     if a == 0 {
                         return;
                     }
+                    let a32 = a as u32;
                     let src = tiny_skia::PremultipliedColorU8::from_rgba(
-                        color.r(), color.g(), color.b(), a,
+                        ((color.r() as u32 * a32) / 255) as u8,
+                        ((color.g() as u32 * a32) / 255) as u8,
+                        ((color.b() as u32 * a32) / 255) as u8,
+                        a,
                     ).unwrap();
 
                     for row in y..(y + h as i32).min(ch) {
