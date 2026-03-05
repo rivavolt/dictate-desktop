@@ -205,15 +205,17 @@ impl Tray for DictateTray {
 
 pub async fn spawn(
     cmd_tx: mpsc::Sender<TrayCommand>,
+    state: &config::State,
 ) -> anyhow::Result<ksni::Handle<DictateTray>> {
+    let langs = sorted_languages();
     let tray = DictateTray {
         recording: false,
-        mode: 0,
-        output: 0,
-        lang: 0,
-        model: 0,
-        enter: false,
-        langs: sorted_languages(),
+        mode: MODES.iter().position(|&m| m == state.mode).unwrap_or(0),
+        output: OUTPUTS.iter().position(|&o| o == state.output).unwrap_or(0),
+        lang: langs.iter().position(|(c, _)| *c == state.lang).unwrap_or(0),
+        model: config::ALL_MODELS.iter().position(|&m| m == state.model).unwrap_or(0),
+        enter: state.enter,
+        langs,
         cmd_tx,
     };
     let handle = tray.spawn().await?;

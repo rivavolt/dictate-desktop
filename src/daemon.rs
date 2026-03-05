@@ -565,8 +565,11 @@ impl DaemonState {
 }
 
 pub async fn run() -> Result<()> {
+    let config = Config::new();
+    let state = State::load(&config);
+
     let (tray_tx, mut tray_rx) = mpsc::channel::<tray::TrayCommand>(16);
-    let tray_handle = match tray::spawn(tray_tx).await {
+    let tray_handle = match tray::spawn(tray_tx, &state).await {
         Ok(h) => Some(h),
         Err(e) => {
             tracing::warn!("tray unavailable: {e}");
@@ -581,8 +584,6 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    let config = Config::new();
-    let state = State::load(&config);
     let overlay_handle = overlay::spawn(state.font.clone())?;
     let mut daemon = DaemonState::new(config, state, tray_handle, overlay_handle);
 
