@@ -28,6 +28,13 @@
               default = null;
               description = "Path to environment file with API keys for STT providers";
             };
+
+            proxy = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "socks5h://127.0.0.1:1080";
+              description = "SOCKS/HTTP proxy for API requests (DICTATE_PROXY)";
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -44,7 +51,7 @@
                   "PATH=${lib.makeBinPath [ pkgs.pipewire pkgs.fontconfig ]}"
                   "XDG_RUNTIME_DIR=/run/user/%U"
                   "FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.inter ]; }}"
-                ];
+                ] ++ lib.optional (cfg.proxy != null) "DICTATE_PROXY=${cfg.proxy}";
                 Type = "simple";
                 ExecStart = "${dictate}/bin/dictate daemon";
                 Restart = "on-failure";
@@ -95,7 +102,8 @@
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/dictate \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.libglvnd pkgs.wayland ]}"
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.libglvnd pkgs.wayland ]}" \
+              --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.flac ]}"
           '';
           inherit (unwrapped) meta;
         };

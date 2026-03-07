@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use webrtc_vad::{SampleRate, Vad, VadMode};
 
+use crate::audio;
 use crate::config;
 use crate::daemon;
 use crate::output;
@@ -21,10 +22,10 @@ impl SendVad {
     }
 }
 
-const FRAME_SAMPLES: usize = 480; // 30ms at 16kHz
-const FRAME_BYTES: usize = FRAME_SAMPLES * 2;
+const VAD_RATE: u32 = 16000;
+const VAD_FRAME_MS: u32 = 30;
+const VAD_FRAME_SAMPLES: usize = (VAD_RATE * VAD_FRAME_MS / 1000) as usize; // 480
 const SILENCE_THRESHOLD: usize = 27; // 27 * 30ms = 810ms
-const MIN_SPEECH_SAMPLES: usize = 4800; // 300ms at 16kHz
 const PRE_SPEECH_FRAMES: usize = 5; // 150ms
 const DEBOUNCE_FRAMES: usize = 2;
 
@@ -44,12 +45,6 @@ fn encode_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
-fn decode_frame(buf: &[u8], frame: &mut [i16; FRAME_SAMPLES]) {
-    for (i, chunk) in buf[..FRAME_BYTES].chunks_exact(2).enumerate() {
-        frame[i] = i16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-}
-
 pub async fn stream_vad(
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
@@ -58,22 +53,20 @@ pub async fn stream_vad(
     state: &config::State,
     overlay: overlay::Handle,
     transcript_file: PathBuf,
-    history_file: PathBuf,
     chunk_file: PathBuf,
-) -> Result<()> {
-    if sample_rate != 16000 {
-        bail!("VAD requires 16kHz sample rate, got {sample_rate}Hz");
-    }
-
+) -> Result<String> {
     let mut vad = SendVad(Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::Aggressive));
 
-    let mut buf: Vec<u8> = Vec::new();
-    let mut frame = [0i16; FRAME_SAMPLES];
+    // Native-rate frame size for 30ms
+    let native_frame_samples = (sample_rate * VAD_FRAME_MS / 1000) as usize;
+    let min_speech_samples = (sample_rate as usize) * 300 / 1000; // 300ms at native rate
+
+    let mut sample_buf: Vec<i16> = Vec::new();
     let mut speech_active = false;
     let mut silence_count: usize = 0;
     let mut voice_count: usize = 0;
     let mut speech_samples: Vec<i16> = Vec::new();
-    let mut pre_buffer: VecDeque<[i16; FRAME_SAMPLES]> = VecDeque::new();
+    let mut pre_buffer: VecDeque<Vec<i16>> = VecDeque::new();
     let mut full_transcript = String::new();
 
     let _ = std::fs::write(&transcript_file, "");
@@ -85,13 +78,18 @@ pub async fn stream_vad(
             break;
         }
 
-        buf.extend_from_slice(&chunk);
+        // Decode bytes to native-rate i16 samples
+        for c in chunk.chunks_exact(2) {
+            sample_buf.push(i16::from_le_bytes([c[0], c[1]]));
+        }
 
-        while buf.len() >= FRAME_BYTES {
-            decode_frame(&buf, &mut frame);
-            buf.drain(..FRAME_BYTES);
+        while sample_buf.len() >= native_frame_samples {
+            let native_frame: Vec<i16> = sample_buf.drain(..native_frame_samples).collect();
 
-            let is_voice = vad.is_voice_segment(&frame);
+            // Resample to 16kHz for VAD detection
+            let vad_samples = audio::resample(&native_frame, sample_rate, VAD_RATE);
+            let is_voice = vad_samples.len() >= VAD_FRAME_SAMPLES
+                && vad.is_voice_segment(&vad_samples[..VAD_FRAME_SAMPLES]);
 
             if !speech_active {
                 if is_voice {
@@ -102,28 +100,28 @@ pub async fn stream_vad(
                         for pre_frame in pre_buffer.drain(..) {
                             speech_samples.extend_from_slice(&pre_frame);
                         }
-                        speech_samples.extend_from_slice(&frame);
+                        speech_samples.extend_from_slice(&native_frame);
                     } else {
-                        pre_buffer.push_back(frame);
+                        pre_buffer.push_back(native_frame);
                         if pre_buffer.len() > PRE_SPEECH_FRAMES {
                             pre_buffer.pop_front();
                         }
                     }
                 } else {
                     voice_count = 0;
-                    pre_buffer.push_back(frame);
+                    pre_buffer.push_back(native_frame);
                     if pre_buffer.len() > PRE_SPEECH_FRAMES {
                         pre_buffer.pop_front();
                     }
                 }
             } else {
-                speech_samples.extend_from_slice(&frame);
+                speech_samples.extend_from_slice(&native_frame);
                 if is_voice {
                     silence_count = 0;
                 } else {
                     silence_count += 1;
                     if silence_count >= SILENCE_THRESHOLD {
-                        if speech_samples.len() >= MIN_SPEECH_SAMPLES {
+                        if speech_samples.len() >= min_speech_samples {
                             transcribe_chunk(
                                 &speech_samples,
                                 sample_rate,
@@ -150,7 +148,7 @@ pub async fn stream_vad(
     }
 
     // Flush remaining speech
-    if speech_samples.len() >= MIN_SPEECH_SAMPLES {
+    if speech_samples.len() >= min_speech_samples {
         transcribe_chunk(
             &speech_samples,
             sample_rate,
@@ -166,12 +164,7 @@ pub async fn stream_vad(
         .await;
     }
 
-    if state.enter && state.output != "clipboard" && !full_transcript.trim().is_empty() {
-        output::type_enter();
-    }
-    output::append_history(&history_file, full_transcript.trim());
-
-    Ok(())
+    Ok(full_transcript)
 }
 
 async fn transcribe_chunk(

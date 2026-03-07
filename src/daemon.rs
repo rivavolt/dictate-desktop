@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::audio;
 use crate::config::{self, Config, State};
+use crate::correct;
 use crate::deepgram;
 use crate::fireworks;
 use crate::fnkey;
@@ -43,6 +44,71 @@ pub(crate) async fn transcribe_with_retry(
         }
     }
     Err(last_err.unwrap())
+}
+
+/// Common finalization for all modes: correct → clipboard → file → history → sound → overlay
+async fn finalize_transcript(
+    transcript: String,
+    do_correct: bool,
+    correct_hold_ms: u64,
+    lang: &str,
+    enter_after: bool,
+    is_clipboard: bool,
+    already_typed: bool,
+    overlay: &overlay::Handle,
+    transcript_file: &std::path::Path,
+    history_file: &std::path::Path,
+    audio_dir: &std::path::Path,
+    audio_samples: Option<(&[i16], u32)>,
+) {
+    // Archive audio with timestamp
+    if let Some((samples, sample_rate)) = audio_samples {
+        if !samples.is_empty() {
+            let _ = fs::create_dir_all(audio_dir);
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let path = audio_dir.join(format!("{ts}.flac"));
+            if let Err(e) = audio::save_flac(&path, samples, sample_rate) {
+                tracing::warn!("failed to archive audio: {e}");
+            }
+        }
+    }
+
+    let final_text = if do_correct && !transcript.is_empty() {
+        overlay.set_text(transcript.clone());
+        overlay.correcting();
+        match correct::correct_text(&transcript, lang).await {
+            Ok(corrected) => {
+                tracing::info!("corrected: {transcript:?} -> {corrected:?}");
+                corrected
+            }
+            Err(e) => {
+                tracing::warn!("correction failed, using raw: {e}");
+                transcript
+            }
+        }
+    } else {
+        transcript
+    };
+    if !final_text.is_empty() {
+        overlay.set_text(final_text.clone());
+        output::copy_to_clipboard(&final_text);
+        if !already_typed && !is_clipboard {
+            output::type_text(&final_text);
+        }
+        let _ = std::fs::write(transcript_file, &final_text);
+    }
+    if enter_after && !is_clipboard && !final_text.is_empty() {
+        output::type_enter();
+    }
+    output::append_history(history_file, &final_text);
+    sound::play_stop();
+    // Hold corrected text visible — proportional to length, capped
+    if do_correct && !final_text.is_empty() && correct_hold_ms > 0 {
+        let words = final_text.split_whitespace().count() as u64;
+        let hold = (800 + words * 100).min(correct_hold_ms);
+        tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+    }
+    overlay.copied();
 }
 
 struct DaemonState {
@@ -93,6 +159,7 @@ impl DaemonState {
         fs::write(&self.config.state_file, "recording")?;
         sound::play_start();
         self.overlay.show();
+        self.overlay.set_info(self.state.mode.clone(), self.state.lang.clone());
 
         let stop = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop.clone());
@@ -118,20 +185,24 @@ impl DaemonState {
     }
 
     fn start_live(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
-        let (stream, audio_rx, sample_rate) = audio::capture_to_channel(stop.clone())?;
+        let audio_level = self.overlay.audio_level().clone();
+        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level)?;
         self._audio_stream = Some(stream);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<TranscriptEvent>();
 
-        let output_mode = self.state.output.clone();
+        let is_clipboard = self.state.output == "clipboard";
         let enter_after = self.state.enter;
+        let do_correct = self.state.correct;
+        let correct_hold_ms = self.state.correct_hold_ms;
+        let lang = self.state.lang.clone();
         let transcript_file = self.config.transcript_file.clone();
         let history_file = self.config.history_file.clone();
+        let audio_dir = self.config.audio_dir.clone();
         let overlay_handle = self.overlay.clone();
         let state = self.state.clone();
         let provider = provider.to_string();
         self.record_handle = Some(tokio::spawn(async move {
-            let is_clipboard = output_mode == "clipboard";
             let event_handler = tokio::spawn(async move {
                 let mut last_accumulated = String::new();
                 let mut last_pending = String::new();
@@ -143,7 +214,6 @@ impl DaemonState {
                             if !is_clipboard {
                                 output::type_text(&delta);
                             }
-                            let _ = std::fs::write(&transcript_file, &accumulated);
                             last_accumulated = accumulated;
                             last_pending.clear();
                         }
@@ -160,22 +230,17 @@ impl DaemonState {
                     }
                     last_accumulated.push_str(&last_pending);
                     tracing::info!("transcript (flushed pending): {last_pending}");
-                    overlay_handle.set_text(last_accumulated.clone());
                     if !is_clipboard {
                         output::type_text(&last_pending);
                     }
-                    output::copy_to_clipboard(&last_accumulated);
-                    let _ = std::fs::write(&transcript_file, &last_accumulated);
                 }
-                if !last_accumulated.is_empty() {
-                    output::copy_to_clipboard(&last_accumulated);
-                }
-                if enter_after && !is_clipboard && !last_accumulated.is_empty() {
-                    output::type_enter();
-                }
-                output::append_history(&history_file, &last_accumulated);
-                sound::play_stop();
-                overlay_handle.copied();
+                let samples: Vec<i16> = samples_buf.lock().unwrap().clone();
+                finalize_transcript(
+                    last_accumulated, do_correct, correct_hold_ms, &lang,
+                    enter_after, is_clipboard, !is_clipboard,
+                    &overlay_handle, &transcript_file, &history_file,
+                    &audio_dir, Some((&samples, sample_rate)),
+                ).await;
             });
 
             let result = match provider.as_str() {
@@ -189,7 +254,6 @@ impl DaemonState {
             if let Err(e) = result {
                 tracing::error!("live streaming error: {e}");
             }
-            // tx dropped here — wait for event handler to drain remaining events
             let _ = event_handler.await;
         }));
 
@@ -200,16 +264,22 @@ impl DaemonState {
         let audio_file = self.config.audio_file.clone();
         let state = self.state.clone();
         let enter_after = self.state.enter;
+        let do_correct = self.state.correct;
+        let correct_hold_ms = self.state.correct_hold_ms;
+        let lang = self.state.lang.clone();
+        let is_clipboard = self.state.output == "clipboard";
         let transcript_file = self.config.transcript_file.clone();
         let history_file = self.config.history_file.clone();
+        let audio_dir = self.config.audio_dir.clone();
         let provider = provider.to_string();
         let overlay_handle = self.overlay.clone();
+        let audio_level = self.overlay.audio_level().clone();
 
         self.record_handle = Some(tokio::spawn(async move {
             let audio_file2 = audio_file.clone();
             let stop2 = stop.clone();
             let record = tokio::task::spawn_blocking(move || {
-                audio::record_to_file(&audio_file2, stop2)
+                audio::record_to_file(&audio_file2, stop2, audio_level)
             });
 
             while !stop.load(Ordering::Relaxed) {
@@ -223,28 +293,30 @@ impl DaemonState {
                 return;
             }
 
+            // Read samples and sample rate for archival before transcription
+            let (samples_for_archive, archive_rate) = hound::WavReader::open(&audio_file)
+                .map(|r| {
+                    let rate = r.spec().sample_rate;
+                    let samples: Vec<i16> = r.into_samples::<i16>().filter_map(|s| s.ok()).collect();
+                    (samples, rate)
+                })
+                .unwrap_or_default();
+
             let (_, model) = config::parse_provider_model(&state.model);
-            let result = transcribe_with_retry(&audio_file, &provider, &state.lang, model).await;
-
-            match result {
-                Ok(transcript) if !transcript.is_empty() => {
-                    output::copy_to_clipboard(&transcript);
-                    if state.output != "clipboard" {
-                        output::type_text(&transcript);
-                        if enter_after {
-                            output::type_enter();
-                        }
-                    }
-                    let _ = fs::write(&transcript_file, &transcript);
-                    output::append_history(&history_file, &transcript);
-                    overlay_handle.set_text(transcript);
+            let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, model).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("batch transcribe error: {e}");
+                    String::new()
                 }
-                Err(e) => tracing::error!("batch transcribe error: {e}"),
-                _ => {}
-            }
+            };
 
-            sound::play_stop();
-            overlay_handle.copied();
+            finalize_transcript(
+                transcript, do_correct, correct_hold_ms, &lang,
+                enter_after, is_clipboard, false,
+                &overlay_handle, &transcript_file, &history_file,
+                &audio_dir, Some((&samples_for_archive, archive_rate)),
+            ).await;
             let _ = fs::remove_file(&audio_file);
         }));
 
@@ -252,34 +324,42 @@ impl DaemonState {
     }
 
     fn start_vad(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
-        let (stream, audio_rx, sample_rate) = audio::capture_to_channel(stop.clone())?;
+        let audio_level = self.overlay.audio_level().clone();
+        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level)?;
         self._audio_stream = Some(stream);
 
         let state = self.state.clone();
+        let is_clipboard = self.state.output == "clipboard";
+        let enter_after = self.state.enter;
+        let do_correct = self.state.correct;
+        let correct_hold_ms = self.state.correct_hold_ms;
+        let lang = self.state.lang.clone();
         let transcript_file = self.config.transcript_file.clone();
         let history_file = self.config.history_file.clone();
+        let audio_dir = self.config.audio_dir.clone();
         let chunk_file = self.config.audio_file.with_extension("chunk.wav");
         let provider = provider.to_string();
         let overlay_handle = self.overlay.clone();
 
         self.record_handle = Some(tokio::spawn(async move {
-            if let Err(e) = crate::vad::stream_vad(
-                audio_rx,
-                stop,
-                sample_rate,
-                &provider,
-                &state,
-                overlay_handle.clone(),
-                transcript_file,
-                history_file,
-                chunk_file,
-            )
-            .await
-            {
-                tracing::error!("vad error: {e}");
-            }
-            sound::play_stop();
-            overlay_handle.copied();
+            let full_transcript = match crate::vad::stream_vad(
+                audio_rx, stop, sample_rate,
+                &provider, &state, overlay_handle.clone(),
+                transcript_file.clone(), chunk_file,
+            ).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("vad error: {e}");
+                    String::new()
+                }
+            };
+            let samples: Vec<i16> = samples_buf.lock().unwrap().clone();
+            finalize_transcript(
+                full_transcript, do_correct, correct_hold_ms, &lang,
+                enter_after, is_clipboard, !is_clipboard,
+                &overlay_handle, &transcript_file, &history_file,
+                &audio_dir, Some((&samples, sample_rate)),
+            ).await;
         }));
 
         Ok(())
@@ -435,6 +515,41 @@ impl DaemonState {
                     self.state.enter = !self.state.enter;
                     let _ = fs::write(&self.config.enter_file, if self.state.enter { "true" } else { "false" });
                     ipc::Response::ok(format!("enter: {}", if self.state.enter { "on" } else { "off" }))
+                }
+            }
+            "correct" => {
+                if let Some(v) = req.arg {
+                    match v.as_str() {
+                        "on" | "true" => {
+                            self.state.correct = true;
+                            let _ = fs::write(&self.config.correct_file, "true");
+                            ipc::Response::ok("correct: on")
+                        }
+                        "off" | "false" => {
+                            self.state.correct = false;
+                            let _ = fs::write(&self.config.correct_file, "false");
+                            ipc::Response::ok("correct: off")
+                        }
+                        _ => ipc::Response::err("invalid value. use: on, off"),
+                    }
+                } else {
+                    self.state.correct = !self.state.correct;
+                    let _ = fs::write(&self.config.correct_file, if self.state.correct { "true" } else { "false" });
+                    ipc::Response::ok(format!("correct: {}", if self.state.correct { "on" } else { "off" }))
+                }
+            }
+            "correct-hold" => {
+                if let Some(v) = req.arg {
+                    match v.parse::<u64>() {
+                        Ok(ms) => {
+                            self.state.correct_hold_ms = ms;
+                            let _ = fs::write(&self.config.correct_hold_file, &v);
+                            ipc::Response::ok(format!("correct-hold: {ms}ms"))
+                        }
+                        Err(_) => ipc::Response::err("invalid value, expected milliseconds"),
+                    }
+                } else {
+                    ipc::Response::ok(format!("correct-hold: {}ms", self.state.correct_hold_ms))
                 }
             }
             "output" => {
@@ -597,6 +712,9 @@ pub async fn run() -> Result<()> {
                     }
                     tray::TrayCommand::ToggleEnter => {
                         daemon.handle_command(ipc::Request { command: "enter".into(), arg: None });
+                    }
+                    tray::TrayCommand::ToggleCorrect => {
+                        daemon.handle_command(ipc::Request { command: "correct".into(), arg: None });
                     }
                 }
                 daemon.sync_tray_state();

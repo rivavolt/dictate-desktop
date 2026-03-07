@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod correct;
 mod daemon;
 mod deepgram;
 mod fireworks;
@@ -56,6 +57,13 @@ enum Commands {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// Toggle or set LLM correction (on, off). Post-processes transcription with Haiku 4.5
+    Correct {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+    /// Set or show correction hold time in milliseconds
+    CorrectHold { ms: Option<String> },
     /// Set or show overlay font (e.g. "Inter", "JetBrains Mono")
     Font { font: Option<String> },
     /// Set or show model (provider/model). Providers: deepgram, groq, fireworks
@@ -119,6 +127,14 @@ async fn main() -> Result<()> {
                 Commands::Enter { state } => ipc::Request {
                     command: "enter".into(),
                     arg: state,
+                },
+                Commands::Correct { state } => ipc::Request {
+                    command: "correct".into(),
+                    arg: state,
+                },
+                Commands::CorrectHold { ms } => ipc::Request {
+                    command: "correct-hold".into(),
+                    arg: ms,
                 },
                 Commands::Font { font } => ipc::Request {
                     command: "font".into(),

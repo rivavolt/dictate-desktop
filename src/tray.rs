@@ -1,8 +1,55 @@
 use ksni::menu::*;
-use ksni::{self, Tray, TrayMethods};
+use ksni::{self, Icon, Tray, TrayMethods};
 use tokio::sync::mpsc;
 
 use crate::config;
+
+// Phosphor Icons (MIT) — bold for idle, fill for recording
+const MIC_BOLD_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="FILL"><path d="M128,180a52.06,52.06,0,0,0,52-52V64A52,52,0,0,0,76,64v64A52.06,52.06,0,0,0,128,180ZM100,64a28,28,0,0,1,56,0v64a28,28,0,0,1-56,0Zm40,155.22V240a12,12,0,0,1-24,0V219.22A92.14,92.14,0,0,1,36,128a12,12,0,0,1,24,0,68,68,0,0,0,136,0,12,12,0,0,1,24,0A92.14,92.14,0,0,1,140,219.22Z"/></svg>"#;
+const MIC_FILL_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="FILL"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg>"#;
+
+fn render_icon(svg_template: &str, color: &str, size: u32) -> Icon {
+    let svg = svg_template.replace("FILL", color);
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+        .expect("embedded SVG is valid");
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).unwrap();
+    let sx = size as f32 / tree.size().width();
+    let sy = size as f32 / tree.size().height();
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
+    // tiny-skia premultiplied RGBA → non-premultiplied ARGB (network byte order)
+    let mut argb = Vec::with_capacity((size * size * 4) as usize);
+    for pixel in pixmap.pixels() {
+        let a = pixel.alpha();
+        let (r, g, b) = if a > 0 && a < 255 {
+            let a_f = a as f32 / 255.0;
+            (
+                (pixel.red() as f32 / a_f).min(255.0) as u8,
+                (pixel.green() as f32 / a_f).min(255.0) as u8,
+                (pixel.blue() as f32 / a_f).min(255.0) as u8,
+            )
+        } else {
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+        argb.push(a);
+        argb.push(r);
+        argb.push(g);
+        argb.push(b);
+    }
+    Icon { width: size as i32, height: size as i32, data: argb }
+}
+
+struct TrayIcons {
+    idle: Vec<Icon>,
+    recording: Vec<Icon>,
+}
+
+fn make_icons() -> TrayIcons {
+    let sizes = [24, 48];
+    TrayIcons {
+        idle: sizes.iter().map(|&s| render_icon(MIC_BOLD_SVG, "#FFFFFF", s)).collect(),
+        recording: sizes.iter().map(|&s| render_icon(MIC_FILL_SVG, "#E04040", s)).collect(),
+    }
+}
 
 pub enum TrayCommand {
     Toggle,
@@ -11,6 +58,7 @@ pub enum TrayCommand {
     SetLang(String),
     SetModel(String),
     ToggleEnter,
+    ToggleCorrect,
 }
 
 const MODES: &[&str] = &["live", "batch", "vad"];
@@ -32,7 +80,9 @@ pub struct DictateTray {
     lang: usize,
     model: usize,
     enter: bool,
+    correct: bool,
     langs: Vec<(&'static str, &'static str)>,
+    icons: TrayIcons,
     cmd_tx: mpsc::Sender<TrayCommand>,
 }
 
@@ -54,6 +104,7 @@ impl DictateTray {
             .position(|&m| m == state.model)
             .unwrap_or(0);
         self.enter = state.enter;
+        self.correct = state.correct;
     }
 }
 
@@ -75,6 +126,14 @@ impl Tray for DictateTray {
             "media-record".into()
         } else {
             "audio-input-microphone".into()
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        if self.recording {
+            self.icons.recording.clone()
+        } else {
+            self.icons.idle.clone()
         }
     }
 
@@ -192,6 +251,16 @@ impl Tray for DictateTray {
             ..Default::default()
         };
 
+        let correct_item = CheckmarkItem {
+            label: "LLM Correct".into(),
+            checked: self.correct,
+            activate: Box::new(|tray: &mut Self| {
+                tray.correct = !tray.correct;
+                let _ = tray.cmd_tx.try_send(TrayCommand::ToggleCorrect);
+            }),
+            ..Default::default()
+        };
+
         vec![
             mode_menu.into(),
             output_menu.into(),
@@ -199,6 +268,7 @@ impl Tray for DictateTray {
             model_menu.into(),
             MenuItem::Separator,
             enter_item.into(),
+            correct_item.into(),
         ]
     }
 }
@@ -215,7 +285,9 @@ pub async fn spawn(
         lang: langs.iter().position(|(c, _)| *c == state.lang).unwrap_or(0),
         model: config::ALL_MODELS.iter().position(|&m| m == state.model).unwrap_or(0),
         enter: state.enter,
+        correct: state.correct,
         langs,
+        icons: make_icons(),
         cmd_tx,
     };
     let handle = tray.spawn().await?;

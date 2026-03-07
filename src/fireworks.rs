@@ -194,7 +194,7 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
 
     let file_part = reqwest::multipart::Part::bytes(file_bytes)
         .file_name(file_name)
-        .mime_str("audio/wav")?;
+        .mime_str(crate::audio::audio_mime(path))?;
 
     let mut form = reqwest::multipart::Form::new()
         .part("file", file_part)
@@ -215,6 +215,9 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
         .await?;
 
     let json: serde_json::Value = serde_json::from_str(&resp)?;
+    if let Some(err) = json.get("error") {
+        anyhow::bail!("Fireworks: {}", err);
+    }
     let text = json["text"].as_str().unwrap_or("").to_string();
     Ok(text)
 }

@@ -137,8 +137,11 @@ pub struct Config {
     pub output_file: PathBuf,
     pub font_file: PathBuf,
     pub enter_file: PathBuf,
+    pub correct_file: PathBuf,
+    pub correct_hold_file: PathBuf,
     pub model_file: PathBuf,
     pub history_file: PathBuf,
+    pub audio_dir: PathBuf,
     pub socket_path: PathBuf,
 }
 
@@ -161,8 +164,11 @@ impl Config {
             output_file: state_dir.join("output"),
             font_file: state_dir.join("font"),
             enter_file: state_dir.join("enter"),
+            correct_file: state_dir.join("correct"),
+            correct_hold_file: state_dir.join("correct_hold_ms"),
             model_file: state_dir.join("model"),
             history_file: state_dir.join("history.log"),
+            audio_dir: state_dir.join("audio"),
             socket_path: runtime_dir.join("dictate.sock"),
         }
     }
@@ -179,10 +185,15 @@ pub fn parse_provider_model(s: &str) -> (&str, &str) {
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("http client")
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30));
+        if let Ok(proxy_url) = std::env::var("DICTATE_PROXY") {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                tracing::info!("using proxy {proxy_url}");
+                builder = builder.proxy(proxy);
+            }
+        }
+        builder.build().expect("http client")
     })
 }
 
@@ -204,6 +215,8 @@ pub struct State {
     pub mode: String,
     pub output: String,
     pub enter: bool,
+    pub correct: bool,
+    pub correct_hold_ms: u64,
     pub font: String,
 }
 
@@ -236,12 +249,21 @@ impl State {
             .map(|s| s.trim() == "true")
             .unwrap_or(false);
 
+        let correct = fs::read_to_string(&config.correct_file)
+            .map(|s| s.trim() != "false")
+            .unwrap_or(true);
+
+        let correct_hold_ms = fs::read_to_string(&config.correct_hold_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(3000);
+
         let font = fs::read_to_string(&config.font_file)
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| {
                 std::env::var("DICTATE_FONT").unwrap_or_else(|_| "Inter".to_string())
             });
 
-        Self { lang, model, mode, output, enter, font }
+        Self { lang, model, mode, output, enter, correct, correct_hold_ms, font }
     }
 }

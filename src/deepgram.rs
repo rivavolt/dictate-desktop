@@ -158,7 +158,7 @@ pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) ->
     let response = config::http_client()
         .post(&url)
         .header("Authorization", format!("Token {}", api_key))
-        .header("Content-Type", "audio/wav")
+        .header("Content-Type", crate::audio::audio_mime(path))
         .body(audio_data)
         .send()
         .await?
@@ -166,6 +166,9 @@ pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) ->
         .await?;
 
     let json: serde_json::Value = serde_json::from_str(&response)?;
+    if let Some(err) = json.get("err_msg").or_else(|| json.get("error")) {
+        anyhow::bail!("Deepgram: {}", err);
+    }
     let transcript = json["results"]["channels"][0]["alternatives"][0]["transcript"]
         .as_str()
         .unwrap_or("")
