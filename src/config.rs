@@ -217,6 +217,8 @@ pub struct State {
     pub correct_hold_ms: u64,
     #[serde(default = "default_font")]
     pub font: String,
+    #[serde(default)]
+    pub input: String,
 }
 
 fn default_lang() -> String { std::env::var("DICTATE_LANG").unwrap_or_else(|_| AUTO_LANG.to_string()) }

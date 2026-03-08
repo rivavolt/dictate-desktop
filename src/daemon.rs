@@ -186,7 +186,7 @@ impl DaemonState {
 
     fn start_live(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
         let audio_level = self.overlay.audio_level().clone();
-        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level)?;
+        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level, &self.state.input)?;
         self._audio_stream = Some(stream);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<TranscriptEvent>();
@@ -275,11 +275,12 @@ impl DaemonState {
         let overlay_handle = self.overlay.clone();
         let audio_level = self.overlay.audio_level().clone();
 
+        let input_device = self.state.input.clone();
         self.record_handle = Some(tokio::spawn(async move {
             let audio_file2 = audio_file.clone();
             let stop2 = stop.clone();
             let record = tokio::task::spawn_blocking(move || {
-                audio::record_to_file(&audio_file2, stop2, audio_level)
+                audio::record_to_file(&audio_file2, stop2, audio_level, &input_device)
             });
 
             while !stop.load(Ordering::Relaxed) {
@@ -325,7 +326,7 @@ impl DaemonState {
 
     fn start_vad(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
         let audio_level = self.overlay.audio_level().clone();
-        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level)?;
+        let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level, &self.state.input)?;
         self._audio_stream = Some(stream);
 
         let state = self.state.clone();
@@ -563,6 +564,42 @@ impl DaemonState {
                         "output: {} (available: type, clipboard)",
                         self.state.output
                     ))
+                }
+            }
+            "input" => {
+                if let Some(name) = req.arg {
+                    if name == "default" {
+                        self.state.input.clear();
+                        self.state.save(&self.config);
+                        ipc::Response::ok("input: default")
+                    } else {
+                        let devices = audio::list_input_devices();
+                        if devices.iter().any(|d| d == &name) {
+                            self.state.input = name.clone();
+                            self.state.save(&self.config);
+                            ipc::Response::ok(format!("input: {name}"))
+                        } else {
+                            ipc::Response::err(format!("device '{name}' not found"))
+                        }
+                    }
+                } else {
+                    let current = if self.state.input.is_empty() {
+                        format!("default ({})", audio::default_input_name())
+                    } else {
+                        self.state.input.clone()
+                    };
+                    let devices = audio::list_input_devices();
+                    let default_name = audio::default_input_name();
+                    let list = devices.iter().map(|d| {
+                        let is_current = if self.state.input.is_empty() {
+                            d == &default_name
+                        } else {
+                            d == &self.state.input
+                        };
+                        let marker = if is_current { " *" } else { "" };
+                        format!("  {d}{marker}")
+                    }).collect::<Vec<_>>().join("\n");
+                    ipc::Response::ok(format!("input: {current}\navailable:\n{list}"))
                 }
             }
             "model" => {

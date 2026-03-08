@@ -66,6 +66,8 @@ enum Commands {
     CorrectHold { ms: Option<String> },
     /// Set or show overlay font (e.g. "Inter", "JetBrains Mono")
     Font { font: Option<String> },
+    /// Set or show audio input device
+    Input { device: Option<String> },
     /// Set or show model (provider/model). Providers: deepgram, groq, fireworks
     Model {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(config::ALL_MODELS))]
@@ -139,6 +141,10 @@ async fn main() -> Result<()> {
                 Commands::Font { font } => ipc::Request {
                     command: "font".into(),
                     arg: font,
+                },
+                Commands::Input { device } => ipc::Request {
+                    command: "input".into(),
+                    arg: device,
                 },
                 Commands::Model { model } => ipc::Request {
                     command: "model".into(),

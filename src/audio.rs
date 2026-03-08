@@ -14,9 +14,29 @@ pub struct AudioConfig {
     pub sample_rate: u32,
 }
 
-pub fn get_audio_config() -> Result<AudioConfig> {
+pub fn list_input_devices() -> Vec<String> {
     let host = cpal::default_host();
-    let device = host.default_input_device().context("no input device")?;
+    host.input_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+pub fn default_input_name() -> String {
+    let host = cpal::default_host();
+    host.default_input_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_default()
+}
+
+pub fn get_audio_config(device_name: &str) -> Result<AudioConfig> {
+    let host = cpal::default_host();
+    let device = if device_name.is_empty() {
+        host.default_input_device().context("no input device")?
+    } else {
+        host.input_devices()?
+            .find(|d| d.name().map(|n| n == device_name).unwrap_or(false))
+            .with_context(|| format!("input device '{}' not found", device_name))?
+    };
     let config_range = device
         .supported_input_configs()?
         .filter(|c| c.channels() <= CHANNELS && c.sample_format() == cpal::SampleFormat::F32)
@@ -57,8 +77,9 @@ pub type SamplesBuf = Arc<std::sync::Mutex<Vec<i16>>>;
 pub fn capture_to_channel(
     stop: Arc<AtomicBool>,
     audio_level: Arc<AtomicU32>,
+    device_name: &str,
 ) -> Result<(cpal::Stream, mpsc::Receiver<Vec<u8>>, u32, SamplesBuf)> {
-    let cfg = get_audio_config()?;
+    let cfg = get_audio_config(device_name)?;
     let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
     let samples_buf: SamplesBuf = Arc::new(std::sync::Mutex::new(Vec::new()));
     let samples_cb = samples_buf.clone();
@@ -161,8 +182,8 @@ pub fn audio_mime(path: &std::path::Path) -> &'static str {
 }
 
 /// Record audio to a WAV file until stop is signaled.
-pub fn record_to_file(path: &std::path::Path, stop: Arc<AtomicBool>, audio_level: Arc<AtomicU32>) -> Result<()> {
-    let cfg = get_audio_config()?;
+pub fn record_to_file(path: &std::path::Path, stop: Arc<AtomicBool>, audio_level: Arc<AtomicU32>, device_name: &str) -> Result<()> {
+    let cfg = get_audio_config(device_name)?;
     let spec = hound::WavSpec {
         channels: CHANNELS,
         sample_rate: cfg.sample_rate,
