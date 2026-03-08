@@ -39,6 +39,7 @@ const SHADOW_OFFSET_Y: f32 = 6.0;
 const SHADOW_PAD: u32 = 26;
 const SHADOW_PAD_BOT: u32 = 8;
 const PILL_ICON_PAD: f32 = 0.30; // fraction of pill height reserved as padding on each side
+const CHUNK_TAU: f32 = 80.0;
 
 // Phosphor Icons (MIT) — Check Bold, green to match done glow
 const CHECK_BOLD_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="#33b34d"><path d="M232.49,80.49l-128,128a12,12,0,0,1-17,0l-56-56a12,12,0,1,1,17-17L96,183,215.51,63.51a12,12,0,0,1,17,17Z"/></svg>"##;
@@ -255,6 +256,8 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         last_egl_h: 0,
         check_icon,
         correct_fade: 1.0,
+        reveal_len: 0,
+        chunk_fade: 1.0,
         exit: false,
     };
 
@@ -283,6 +286,8 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.text.clear();
                     state.pending.clear();
                     state.wrapped_dirty = true;
+                    state.reveal_len = 0;
+                    state.chunk_fade = 1.0;
                     state.fade_alpha = 0.0;
                     state.fade_target = 1.0;
                     let pill_w = PILL_SIZE as f32 * state.scale as f32;
@@ -309,6 +314,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.text = text;
                     state.pending.clear();
                     state.wrapped_dirty = true;
+                    state.update_reveal();
                     if state.visible {
                         state.resize_and_redraw();
                     }
@@ -321,6 +327,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.processing = false;
                     state.pending = text;
                     state.wrapped_dirty = true;
+                    state.update_reveal();
                     if state.visible {
                         state.resize_and_redraw();
                     }
@@ -431,6 +438,8 @@ struct State {
     last_egl_h: i32,
     check_icon: ImageId,
     correct_fade: f32,  // text crossfade during correction: 0=invisible, 1=visible
+    reveal_len: usize,  // bytes of display text fully visible
+    chunk_fade: f32,    // 0→1 fade for text after reveal_len
     exit: bool,
 }
 
@@ -472,6 +481,7 @@ impl State {
             || self.correcting
             || self.done
             || self.correct_fade < 0.99
+            || self.chunk_fade < 0.99
             || f32::from_bits(self.audio_level.load(Ordering::Relaxed)) > 0.001
         )
     }
@@ -547,6 +557,15 @@ impl State {
             needs_redraw = true;
         }
 
+        // Chunk reveal fade
+        if self.chunk_fade < 0.99 {
+            chase(&mut self.chunk_fade, 1.0, CHUNK_TAU, dt, 0.01);
+            if self.chunk_fade >= 0.99 {
+                self.reveal_len = self.display_text().len();
+            }
+            needs_redraw = true;
+        }
+
         // Audio-reactive bar levels (drive whenever mic is active)
         let raw_audio_level = f32::from_bits(self.audio_level.load(Ordering::Relaxed));
         if raw_audio_level > 0.001 {
@@ -599,6 +618,21 @@ impl State {
             full.push_str(&self.pending);
         }
         full
+    }
+
+    fn update_reveal(&mut self) {
+        if self.correcting {
+            self.reveal_len = self.display_text().len();
+            self.chunk_fade = 1.0;
+            return;
+        }
+        let new_len = self.display_text().len();
+        if new_len < self.reveal_len {
+            self.reveal_len = new_len;
+        }
+        if new_len > self.reveal_len && self.chunk_fade >= 0.99 {
+            self.chunk_fade = 0.0;
+        }
     }
 
     fn measure_text_width(&self, text: &str, font_size: f32) -> f32 {
@@ -741,7 +775,7 @@ impl State {
             0.0
         };
 
-        let bg_alpha = 0.7 * self.fade_alpha;
+        let bg_alpha = 0.92 * self.fade_alpha;
         let target_h = PILL_SIZE as f32 * sf;
 
         // Pill shrinks to a circle for both recording and copied icons
@@ -796,17 +830,17 @@ impl State {
         // Colored glow: red for recording, yellow for correcting, green for done
         {
             let (gr, gg, gb, ga) = if self.listening {
-                (0.8, 0.1, 0.08, 0.35)
+                (0.8, 0.1, 0.08, 0.6)
             } else if self.correcting {
-                (0.85, 0.65, 0.1, 0.3)
+                (0.85, 0.65, 0.1, 0.5)
             } else if self.done {
-                (0.2, 0.7, 0.3, 0.3)
+                (0.2, 0.7, 0.3, 0.5)
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
             if ga > 0.0 {
                 let glow_pulse = (self.anim_phase * 0.8).sin() * 0.15 + 0.85;
-                let mut glow_path = make_bg_path(SHADOW_FEATHER * sf);
+                let glow_path = make_bg_path(SHADOW_FEATHER * sf);
                 let glow_paint = Paint::box_gradient(
                     rx, ry,
                     rw, rh,
@@ -829,7 +863,7 @@ impl State {
                     rx, ry, rw, rh,
                     if is_circle { rh / 2.0 } else { r },
                     SHADOW_FEATHER * sf * (0.6 + avg_level * 0.6),
-                    Color::rgbaf(0.8, 0.12, 0.08, 0.4 * avg_level * self.fade_alpha),
+                    Color::rgbaf(0.8, 0.12, 0.08, 0.6 * avg_level * self.fade_alpha),
                     Color::rgbaf(0.8, 0.12, 0.08, 0.0),
                 );
                 self.canvas.fill_path(&glow_path, &glow_paint);
@@ -933,23 +967,27 @@ impl State {
             let final_with_sep = format!("{}{separator}", self.text);
 
             let pending_alpha = text_alpha * 0.5;
+            let chunk_text_alpha = text_alpha * self.chunk_fade;
+            let chunk_pending_alpha = pending_alpha * self.chunk_fade;
 
-            // Render each line, coloring final vs pending portions.
-            // Track position in the display string by finding each wrapped line's
-            // start via str::find, which is correct for any UTF-8 content.
             let split_at = final_with_sep.len();
+            let reveal_at = self.reveal_len;
             let base_y = pad + ph - PADDING_Y * sf - total_text_h + scroll_y;
             let mut display_pos = 0usize;
 
-            let mut final_paint = Paint::color(Color::rgbaf(1.0, 1.0, 1.0, text_alpha));
-            final_paint.set_font(&[self.font_id]);
-            final_paint.set_font_size(font_sz);
-            final_paint.set_text_baseline(Baseline::Middle);
-
-            let mut pend_paint = Paint::color(Color::rgbaf(0.6, 0.6, 0.6, pending_alpha));
-            pend_paint.set_font(&[self.font_id]);
-            pend_paint.set_font_size(font_sz);
-            pend_paint.set_text_baseline(Baseline::Middle);
+            let make_paint = |r: f32, g: f32, b: f32, a: f32| -> Paint {
+                let mut p = Paint::color(Color::rgbaf(r, g, b, a));
+                p.set_font(&[self.font_id]);
+                p.set_font_size(font_sz);
+                p.set_text_baseline(Baseline::Middle);
+                p
+            };
+            let paints = [
+                make_paint(1.0, 1.0, 1.0, text_alpha),           // revealed final
+                make_paint(0.6, 0.6, 0.6, pending_alpha),        // revealed pending
+                make_paint(1.0, 1.0, 1.0, chunk_text_alpha),     // new final
+                make_paint(0.6, 0.6, 0.6, chunk_pending_alpha),  // new pending
+            ];
 
             for (i, line) in self.wrapped_lines.iter().enumerate() {
                 let y = base_y + (i as f32 + 0.5) * self.line_height * sf - scroll_y;
@@ -966,23 +1004,27 @@ impl State {
                     continue;
                 }
 
-                if line_end <= split_at {
-                    let _ = self.canvas.fill_text(text_x, y, line, &final_paint);
-                } else if line_start >= split_at {
-                    let _ = self.canvas.fill_text(text_x, y, line, &pend_paint);
-                } else {
-                    // Line spans the boundary — split at char boundary
-                    let byte_in_line = split_at - line_start;
-                    // Ensure we split on a char boundary
-                    let boundary = line.floor_char_boundary(byte_in_line);
-                    let final_part = &line[..boundary];
-                    let pending_part = &line[boundary..];
+                // Two split points within this line (clamped, snapped to char boundaries)
+                let sp = line.floor_char_boundary((split_at.saturating_sub(line_start)).min(line.len()));
+                let rp = line.floor_char_boundary((reveal_at.saturating_sub(line_start)).min(line.len()));
 
-                    let _ = self.canvas.fill_text(text_x, y, final_part, &final_paint);
-                    if !pending_part.is_empty() {
-                        let final_w = self.measure_text_width(final_part, font_sz);
-                        let _ = self.canvas.fill_text(text_x + final_w, y, pending_part, &pend_paint);
-                    }
+                let mut cuts = [0, sp, rp, line.len()];
+                cuts.sort();
+
+                let mut x_off = 0.0f32;
+                for pair in cuts.windows(2) {
+                    let (s, e) = (pair[0], pair[1]);
+                    if s >= e { continue; }
+                    let segment = &line[s..e];
+                    let byte_pos = line_start + s;
+                    let paint_idx = match (byte_pos < split_at, byte_pos < reveal_at) {
+                        (true, true)   => 0, // revealed final
+                        (false, true)  => 1, // revealed pending
+                        (true, false)  => 2, // new final
+                        (false, false) => 3, // new pending
+                    };
+                    let _ = self.canvas.fill_text(text_x + x_off, y, segment, &paints[paint_idx]);
+                    x_off += self.measure_text_width(segment, font_sz);
                 }
             }
 
