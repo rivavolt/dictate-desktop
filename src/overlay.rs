@@ -1,5 +1,5 @@
 use anyhow::Result;
-use femtovg::{Baseline, Canvas, Color, FontId, ImageFlags, ImageId, Paint, Path};
+use femtovg::{Baseline, Canvas, Color, FontId, Paint, Path};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use khronos_egl as egl;
@@ -41,9 +41,6 @@ const SHADOW_PAD_BOT: u32 = 8;
 const PILL_ICON_PAD: f32 = 0.30; // fraction of pill height reserved as padding on each side
 const CHUNK_TAU: f32 = 80.0;
 const FINALIZE_TAU: f32 = 60.0;
-
-// Phosphor Icons (MIT) — Check Bold, green to match done glow
-const CHECK_BOLD_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="#33b34d"><path d="M232.49,80.49l-128,128a12,12,0,0,1-17,0l-56-56a12,12,0,1,1,17-17L96,183,215.51,63.51a12,12,0,0,1,17,17Z"/></svg>"##;
 
 pub enum Command {
     Show,
@@ -206,8 +203,6 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
     let font_id = canvas.add_font(&font_path)?;
     tracing::debug!("overlay: loaded font {font_name} from {font_path}");
 
-    let check_icon = render_svg_to_image(&mut canvas, CHECK_BOLD_SVG, 64);
-
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -228,7 +223,6 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         listening: false,
         processing: false,
         correcting: false,
-        done: false,
         shrink_t: 0.0,
         shrink_target: 0.0,
         pill_countdown: 0.0,
@@ -237,6 +231,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         anim_phase: 0.0,
         audio_level,
         audio_peak: 0.05,
+        smooth_audio: 0.0,
         bar_levels: [0.0; 4],
         fade_alpha: 0.0,
         fade_target: 0.0,
@@ -255,7 +250,6 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         committed_layer_h: PILL_SIZE + SHADOW_PAD + SHADOW_PAD_BOT,
         last_egl_w: 0,
         last_egl_h: 0,
-        check_icon,
         correct_fade: 1.0,
         reveal_len: 0,
         chunk_fade: 1.0,
@@ -282,7 +276,6 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.listening = true;
                     state.processing = false;
                     state.correcting = false;
-                    state.done = false;
                     state.shrink_t = 1.0;
                     state.shrink_target = 1.0;
                     state.pill_countdown = 0.0;
@@ -351,8 +344,9 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     if state.text.is_empty() {
                         state.fade_target = 0.0;
                     } else {
-                        state.done = true;
-                        state.shrink_target = 1.0;
+                        // Hold: 1.5s base + up to 2s for longer text
+                        let len_s = (state.text.len() as f32 / 80.0).min(4.0) * 0.5;
+                        state.pill_countdown = 1.5 + len_s;
                         state.resize_and_redraw();
                     }
                 }
@@ -415,7 +409,6 @@ struct State {
     listening: bool,
     processing: bool,
     correcting: bool,
-    done: bool,
     shrink_t: f32,
     shrink_target: f32,
     pill_countdown: f32,
@@ -423,7 +416,8 @@ struct State {
     render_w: f32,
     anim_phase: f32,
     audio_level: Arc<AtomicU32>,
-    audio_peak: f32, // rolling peak for normalization
+    audio_peak: f32,  // rolling peak for normalization
+    smooth_audio: f32, // low-pass filtered audio level for bar targets
     bar_levels: [f32; 4],
     fade_alpha: f32,
     fade_target: f32,
@@ -442,28 +436,12 @@ struct State {
     committed_layer_h: u32,
     last_egl_w: i32,
     last_egl_h: i32,
-    check_icon: ImageId,
     correct_fade: f32,  // text crossfade during correction: 0=invisible, 1=visible
     reveal_len: usize,  // bytes of display text fully visible
     chunk_fade: f32,    // 0→1 fade for text after reveal_len
     color_split: usize, // bytes of confirmed-white final text
     finalize_fade: f32, // 0→1 grey→white for newly finalized text
     exit: bool,
-}
-
-fn render_svg_to_image(canvas: &mut Canvas<femtovg::renderer::OpenGl>, svg: &str, size: u32) -> ImageId {
-    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default())
-        .expect("embedded SVG is valid");
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).unwrap();
-    let sx = size as f32 / tree.size().width();
-    let sy = size as f32 / tree.size().height();
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
-    // tiny-skia pixels are RGBA premultiplied — convert to femtovg RGBA8
-    let pixels: Vec<femtovg::rgb::RGBA8> = pixmap.pixels().iter().map(|p| {
-        femtovg::rgb::RGBA8::new(p.red(), p.green(), p.blue(), p.alpha())
-    }).collect();
-    let img = femtovg::imgref::ImgRef::new(&pixels, size as usize, size as usize);
-    canvas.create_image(img, ImageFlags::GENERATE_MIPMAPS | ImageFlags::PREMULTIPLIED).unwrap()
 }
 
 fn chase(current: &mut f32, target: f32, tau: f32, dt: f32, epsilon: f32) -> bool {
@@ -487,7 +465,6 @@ impl State {
             || self.listening
             || self.processing
             || self.correcting
-            || self.done
             || self.correct_fade < 0.99
             || self.chunk_fade < 0.99
             || self.finalize_fade < 0.99
@@ -555,7 +532,7 @@ impl State {
         }
 
         // Pulse animation for listening/processing/correcting indicator
-        if self.listening || self.processing || self.correcting || self.done {
+        if self.listening || self.processing || self.correcting {
             self.anim_phase += std::f32::consts::TAU * dt / 1000.0;
             needs_redraw = true;
         }
@@ -596,16 +573,18 @@ impl State {
             }
             self.audio_peak = self.audio_peak.max(0.005); // floor to avoid division issues
             let level = (raw_audio_level / self.audio_peak).clamp(0.0, 1.0);
-            let taus = [12.0, 20.0, 16.0, 25.0];
+            // Smooth the level before deriving bar targets (moderate attack, slow release)
+            let smooth_tau = if level > self.smooth_audio { 50.0 } else { 120.0 };
+            chase(&mut self.smooth_audio, level, smooth_tau, dt, 0.005);
             let vary = [1.0, 0.75, 0.9, 0.65];
             for i in 0..4 {
-                let target = level * vary[i];
-                chase(&mut self.bar_levels[i], target, taus[i], dt, 0.005);
+                let target = self.smooth_audio * vary[i];
+                chase(&mut self.bar_levels[i], target, 30.0, dt, 0.005);
             }
             needs_redraw = true;
         } else if self.bar_levels.iter().any(|&l| l > 0.01) {
             for l in &mut self.bar_levels {
-                chase(l, 0.0, 30.0, dt, 0.005);
+                chase(l, 0.0, 80.0, dt, 0.005);
             }
             needs_redraw = true;
         }
@@ -861,60 +840,37 @@ impl State {
             self.canvas.fill_path(&shadow_path, &shadow_paint);
         }
 
-        // Colored glow: red for recording, yellow for correcting, green for done
-        {
-            let (gr, gg, gb, ga) = if self.listening {
-                (0.8, 0.1, 0.08, 0.6)
-            } else if self.correcting {
-                (0.85, 0.65, 0.1, 0.5)
-            } else if self.done {
-                (0.2, 0.7, 0.3, 0.5)
-            } else {
-                (0.0, 0.0, 0.0, 0.0)
-            };
-            if ga > 0.0 {
-                let glow_pulse = (self.anim_phase * 0.8).sin() * 0.15 + 0.85;
-                let glow_path = make_bg_path(SHADOW_FEATHER * sf);
-                let glow_paint = Paint::box_gradient(
-                    rx, ry,
-                    rw, rh,
-                    if is_circle { rh / 2.0 } else { r },
-                    SHADOW_FEATHER * sf * 1.2,
-                    Color::rgbaf(gr, gg, gb, ga * self.fade_alpha * glow_pulse),
-                    Color::rgbaf(gr, gg, gb, 0.0),
-                );
-                self.canvas.fill_path(&glow_path, &glow_paint);
-            }
-        }
-
-        // Audio-reactive glow — intensity follows waveform
-        {
-            let avg_level = self.bar_levels.iter().sum::<f32>() / 4.0;
-            let in_pill = (self.listening || self.processing) && ease_t > 0.3;
-            if avg_level > 0.005 && !in_pill && self.fade_alpha > 0.01 {
-                let glow_path = make_bg_path(SHADOW_FEATHER * sf);
-                let glow_paint = Paint::box_gradient(
-                    rx, ry, rw, rh,
-                    if is_circle { rh / 2.0 } else { r },
-                    SHADOW_FEATHER * sf * (0.6 + avg_level * 0.6),
-                    Color::rgbaf(0.8, 0.12, 0.08, 0.6 * avg_level * self.fade_alpha),
-                    Color::rgbaf(0.8, 0.12, 0.08, 0.0),
-                );
-                self.canvas.fill_path(&glow_path, &glow_paint);
-            }
-        }
-
         // Background
         {
             let bg_path = make_bg_path(0.0);
             let bg_paint = Paint::color(Color::rgbaf(0.0, 0.0, 0.0, bg_alpha));
             self.canvas.fill_path(&bg_path, &bg_paint);
 
-            // Border
+            // Border (warm color during correction, subtle white otherwise)
             let border_path = make_bg_path(0.0);
-            let mut border_paint = Paint::color(Color::rgbaf(1.0, 1.0, 1.0, 0.12 * self.fade_alpha));
-            border_paint.set_line_width(sf);
+            let (br, bg, bb, ba, bw) = if self.correcting {
+                let pulse = (self.anim_phase * 1.5).sin() * 0.08 + 0.92;
+                (0.9, 0.45, 0.15, 0.7 * pulse * self.fade_alpha, 1.5 * sf)
+            } else {
+                (1.0, 1.0, 1.0, 0.12 * self.fade_alpha, sf)
+            };
+            let mut border_paint = Paint::color(Color::rgbaf(br, bg, bb, ba));
+            border_paint.set_line_width(bw);
             self.canvas.stroke_path(&border_path, &border_paint);
+
+            // Correction progress sweep (indeterminate bar at bottom)
+            if self.correcting && !is_circle {
+                let bar_h = 3.0 * sf;
+                let bar_w = rw * 0.3;
+                let inset = r + 2.0 * sf;
+                let t = (self.anim_phase * 0.5).sin() * 0.5 + 0.5;
+                let bar_x = rx + inset + t * (rw - 2.0 * inset - bar_w);
+                let bar_y = ry + rh - bar_h - sf;
+                let mut bar_path = Path::new();
+                bar_path.rounded_rect(bar_x, bar_y, bar_w, bar_h, bar_h / 2.0);
+                let bar_paint = Paint::color(Color::rgbaf(0.9, 0.45, 0.15, 0.7 * self.fade_alpha));
+                self.canvas.fill_path(&bar_path, &bar_paint);
+            }
         }
 
         // Text opacity (includes correction crossfade)
@@ -954,13 +910,6 @@ impl State {
                     let tw = self.measure_text_width(&label, label_size);
                     let _ = self.canvas.fill_text(cx - tw / 2.0, cy + icon_area * 0.55, &label, &paint);
                 }
-            } else {
-                // Check icon from SVG texture — sized to fill icon_area
-                let icon_sz = icon_area;
-                let paint = Paint::image(self.check_icon, cx - icon_sz / 2.0, cy - icon_sz / 2.0, icon_sz, icon_sz, 0.0, pill_alpha);
-                let mut path = Path::new();
-                path.rect(cx - icon_sz / 2.0, cy - icon_sz / 2.0, icon_sz, icon_sz);
-                self.canvas.fill_path(&path, &paint);
             }
         }
 
@@ -1060,6 +1009,14 @@ impl State {
             }
 
             self.canvas.restore();
+
+            // Waveform bars at bottom of text box (always drawn, min_h shows as dots when silent)
+            {
+                let bar_size = self.line_height * sf * 0.6;
+                let bar_y = ry + rh - PADDING_Y * sf * 0.5;
+                let bar_cx = rx + rw / 2.0;
+                self.draw_waveform_bars(bar_cx, bar_y, bar_size, Color::rgbaf(0.85, 0.25, 0.2, 0.5 * self.fade_alpha));
+            }
         }
 
         self.canvas.flush();
