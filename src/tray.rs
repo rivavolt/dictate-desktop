@@ -129,7 +129,11 @@ impl Tray for DictateTray {
     }
 
     fn icon_name(&self) -> String {
-        String::new()
+        if self.recording {
+            "dictate-recording".into()
+        } else {
+            "dictate-idle".into()
+        }
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
