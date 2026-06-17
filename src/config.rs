@@ -146,21 +146,21 @@ impl Config {
         );
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
-            .join("dictate");
+            .join("dictate-desktop");
         let state_dir = dirs::state_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"))
-            .join("dictate");
+            .join("dictate-desktop");
         let _ = fs::create_dir_all(&config_dir);
         let _ = fs::create_dir_all(&state_dir);
 
         Self {
             config_file: config_dir.join("config.toml"),
-            state_file: runtime_dir.join("dictate.state"),
-            transcript_file: runtime_dir.join("dictate.transcript"),
-            audio_file: runtime_dir.join("dictate.wav"),
+            state_file: runtime_dir.join("dictate-desktop.state"),
+            transcript_file: runtime_dir.join("dictate-desktop.transcript"),
+            audio_file: runtime_dir.join("dictate-desktop.wav"),
             history_file: state_dir.join("history.log"),
             audio_dir: state_dir.join("audio"),
-            socket_path: runtime_dir.join("dictate.sock"),
+            socket_path: runtime_dir.join("dictate-desktop.sock"),
         }
     }
 }

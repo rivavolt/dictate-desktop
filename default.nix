@@ -7,7 +7,7 @@
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "dictate";
+  pname = "dictate-desktop";
   version = "0.2.0";
 
   src = lib.cleanSource ./.;
@@ -25,6 +25,6 @@ rustPlatform.buildRustPackage {
   meta = with lib; {
     description = "Voice-to-text dictation daemon with evdev keybind";
     license = licenses.mit;
-    mainProgram = "dictate";
+    mainProgram = "dictate-desktop";
   };
 }

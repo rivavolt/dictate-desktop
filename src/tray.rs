@@ -117,7 +117,7 @@ impl DictateTray {
 
 impl Tray for DictateTray {
     fn id(&self) -> String {
-        "dictate".into()
+        "dictate-desktop".into()
     }
 
     fn title(&self) -> String {

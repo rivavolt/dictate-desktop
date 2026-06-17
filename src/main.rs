@@ -19,7 +19,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
-#[command(name = "dictate", about = "Voice-to-text dictation daemon")]
+#[command(name = "dictate-desktop", about = "Voice-to-text dictation daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -83,14 +83,14 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Toggle) {
         Commands::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "dictate", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut Cli::command(), "dictate-desktop", &mut std::io::stdout());
             Ok(())
         }
         Commands::Daemon => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("dictate=info".parse().unwrap()),
+                        .add_directive("dictate_desktop=info".parse().unwrap()),
                 )
                 .init();
             daemon::run().await

@@ -135,7 +135,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         &qh,
         surface,
         Layer::Overlay,
-        Some("dictate-overlay"),
+        Some("dictate-desktop-overlay"),
         None,
     );
 
