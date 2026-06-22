@@ -43,9 +43,16 @@ pub async fn stream_live(
         params.push(format!("language={}", state.lang));
     }
     let query = params.join("&");
-    let ws_url = format!(
+    let mut ws_url = format!(
         "wss://audio-streaming.api.fireworks.ai/v1/audio/transcriptions/streaming?{query}"
     );
+    if !state.vocabulary.is_empty() {
+        // Percent-encode the prompt via a real URL so its spaces/commas don't corrupt the query.
+        if let Ok(mut url) = reqwest::Url::parse(&ws_url) {
+            url.query_pairs_mut().append_pair("prompt", &state.vocabulary.join(", "));
+            ws_url = url.into();
+        }
+    }
 
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .method("GET")
@@ -183,7 +190,7 @@ pub async fn stream_live(
     Ok(())
 }
 
-pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<String> {
+pub async fn transcribe_file(path: &Path, lang: &str, model: &str, vocabulary: &[String]) -> Result<String> {
     let api_key = config::get_api_key("fireworks")?;
 
     let file_bytes = tokio::fs::read(path).await?;
@@ -204,6 +211,9 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
 
     if !lang.is_empty() && lang != config::AUTO_LANG {
         form = form.text("language", lang.to_string());
+    }
+    if !vocabulary.is_empty() {
+        form = form.text("prompt", vocabulary.join(", "));
     }
 
     let resp = config::http_client()

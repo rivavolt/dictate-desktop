@@ -48,7 +48,17 @@ pub async fn stream_live(
     let params = format!(
         "sample_rate={STREAM_RATE}&encoding=pcm_s16le&speech_model={speech_model}&format_turns=true"
     );
-    let ws_url = format!("wss://streaming.assemblyai.com/v3/ws?{params}");
+    let mut ws_url = format!("wss://streaming.assemblyai.com/v3/ws?{params}");
+    if !state.vocabulary.is_empty() {
+        // keyterms_prompt is a repeated query param; build it with a real URL so terms with
+        // spaces/punctuation are percent-encoded rather than corrupting the query string.
+        if let Ok(mut url) = reqwest::Url::parse(&ws_url) {
+            for term in &state.vocabulary {
+                url.query_pairs_mut().append_pair("keyterms_prompt", term);
+            }
+            ws_url = url.into();
+        }
+    }
 
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .method("GET")
@@ -180,7 +190,7 @@ fn resample_pcm(data: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
         .collect()
 }
 
-pub async fn transcribe_file(path: &Path, lang: &str, expected: &[String], _model: &str) -> Result<String> {
+pub async fn transcribe_file(path: &Path, lang: &str, expected: &[String], _model: &str, vocabulary: &[String], remove_fillers: bool) -> Result<String> {
     let api_key = config::get_api_key("assemblyai")?;
     let client = config::http_client();
 
@@ -213,6 +223,10 @@ pub async fn transcribe_file(path: &Path, lang: &str, expected: &[String], _mode
         }
     } else {
         body["language_code"] = json!(lang);
+    }
+    body["disfluencies"] = json!(!remove_fillers);
+    if !vocabulary.is_empty() {
+        body["keyterms_prompt"] = json!(vocabulary);
     }
 
     let submit: Value = client

@@ -28,6 +28,25 @@ struct LiveAlternative {
     transcript: String,
 }
 
+/// Append Deepgram recognition-tuning query params: keyterms (nova-3 uses `keyterm`, older models
+/// `keywords`) only when a vocabulary is set, and `filler_words` always — its default-derived value
+/// (filler_words=false when fillers are removed) matches Deepgram's own default, so the request is
+/// byte-equivalent to the old one when no vocabulary is configured.
+fn augment_query(url: String, model: &str, vocabulary: &[String], remove_fillers: bool) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(&url) else {
+        return url;
+    };
+    let nova3 = model.contains("nova-3") || model.contains("nova3");
+    let key = if nova3 { "keyterm" } else { "keywords" };
+    for term in vocabulary {
+        parsed.query_pairs_mut().append_pair(key, term);
+    }
+    parsed
+        .query_pairs_mut()
+        .append_pair("filler_words", if remove_fillers { "false" } else { "true" });
+    parsed.into()
+}
+
 pub async fn stream_live(
     state: &config::State,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
@@ -43,7 +62,12 @@ pub async fn stream_live(
         "model={}&language={}&encoding=linear16&sample_rate={}&channels=1&smart_format=true&interim_results=true&endpointing=300",
         model, api_lang, sample_rate
     );
-    let ws_url = format!("wss://api.deepgram.com/v1/listen?{}", params);
+    let ws_url = augment_query(
+        format!("wss://api.deepgram.com/v1/listen?{}", params),
+        model,
+        &state.vocabulary,
+        state.remove_fillers,
+    );
 
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .method("GET")
@@ -146,13 +170,14 @@ pub async fn stream_live(
     Ok(())
 }
 
-pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str) -> Result<String> {
+pub async fn transcribe_file(path: &std::path::Path, lang: &str, model: &str, vocabulary: &[String], remove_fillers: bool) -> Result<String> {
     let api_key = config::get_api_key("deepgram")?;
     let api_lang = if lang == config::AUTO_LANG { "multi" } else { lang };
-    let url = format!(
+    let mut url = format!(
         "https://api.deepgram.com/v1/listen?model={}&language={}&smart_format=true",
         model, api_lang
     );
+    url = augment_query(url, model, vocabulary, remove_fillers);
 
     let audio_data = tokio::fs::read(path).await?;
     let response = config::http_client()

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::config;
 
-pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<String> {
+pub async fn transcribe_file(path: &Path, lang: &str, model: &str, vocabulary: &[String]) -> Result<String> {
     let api_key = config::get_api_key("groq")?;
 
     let file_bytes = tokio::fs::read(path).await?;
@@ -24,6 +24,9 @@ pub async fn transcribe_file(path: &Path, lang: &str, model: &str) -> Result<Str
 
     if !lang.is_empty() && lang != config::AUTO_LANG {
         form = form.text("language", lang.to_string());
+    }
+    if !vocabulary.is_empty() {
+        form = form.text("prompt", vocabulary.join(", "));
     }
 
     let resp = config::http_client()

@@ -83,6 +83,8 @@ pub(crate) async fn transcribe_with_retry(
     lang: &str,
     languages: &[String],
     model: &str,
+    vocabulary: &[String],
+    remove_fillers: bool,
 ) -> anyhow::Result<String> {
     let mut last_err = None;
     for attempt in 0..3 {
@@ -92,10 +94,10 @@ pub(crate) async fn transcribe_with_retry(
             tokio::time::sleep(delay).await;
         }
         match match provider {
-            "assemblyai" => assemblyai::transcribe_file(path, lang, languages, model).await,
-            "groq" => groq::transcribe_file(path, lang, model).await,
-            "fireworks" => fireworks::transcribe_file(path, lang, model).await,
-            _ => deepgram::transcribe_file(path, lang, model).await,
+            "assemblyai" => assemblyai::transcribe_file(path, lang, languages, model, vocabulary, remove_fillers).await,
+            "groq" => groq::transcribe_file(path, lang, model, vocabulary).await,
+            "fireworks" => fireworks::transcribe_file(path, lang, model, vocabulary).await,
+            _ => deepgram::transcribe_file(path, lang, model, vocabulary, remove_fillers).await,
         } {
             Ok(t) => return Ok(t),
             Err(e) => {
@@ -482,7 +484,7 @@ impl DaemonState {
 
             let (_, model) = config::parse_provider_model(&state.model);
             let t0 = std::time::Instant::now();
-            let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, &state.languages, model).await {
+            let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, &state.languages, model, &state.vocabulary, state.remove_fillers).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("batch transcribe error: {e}");
