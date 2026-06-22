@@ -9,6 +9,7 @@ mod fnkey;
 mod groq;
 mod inputmethod;
 mod ipc;
+mod keyinject;
 mod output;
 mod overlay;
 mod sound;

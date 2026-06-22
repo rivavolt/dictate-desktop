@@ -2,11 +2,11 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
 use wl_clipboard_rs::copy::{MimeType, Options, Source};
-use wrtype::WrtypeClient;
 
 use crate::inputmethod;
+use crate::keyinject::KeyInject;
 
-static CLIENT: std::sync::OnceLock<Mutex<Option<WrtypeClient>>> = std::sync::OnceLock::new();
+static INJECT: OnceLock<Mutex<Option<KeyInject>>> = OnceLock::new();
 
 // Text output prefers the Wayland input-method protocol: it commits the transcript as a
 // string straight to the focused field, with no synthetic keystrokes — so it can't trip a
@@ -27,20 +27,20 @@ fn input_method() -> Option<&'static inputmethod::Handle> {
         .as_ref()
 }
 
-/// Start the input-method client at daemon boot so a text-input is already associated by the
-/// time the first transcript lands (avoids an unnecessary wrtype fallback on first use).
+/// Start the input-method client and the virtual keyboard at daemon boot, so a text-input is
+/// already associated (avoiding an unnecessary paste fallback on first use) and the fixed keymap is
+/// uploaded before the first paste.
 pub fn init() {
     let _ = input_method();
+    let _ = inject();
 }
 
-fn get_client() -> &'static Mutex<Option<WrtypeClient>> {
-    CLIENT.get_or_init(|| {
-        match WrtypeClient::new() {
-            Ok(c) => Mutex::new(Some(c)),
-            Err(e) => {
-                tracing::error!("virtual keyboard unavailable: {e}");
-                Mutex::new(None)
-            }
+fn inject() -> &'static Mutex<Option<KeyInject>> {
+    INJECT.get_or_init(|| match KeyInject::new() {
+        Ok(k) => Mutex::new(Some(k)),
+        Err(e) => {
+            tracing::error!("virtual keyboard unavailable: {e}");
+            Mutex::new(None)
         }
     })
 }
@@ -74,35 +74,19 @@ pub fn paste(auto_paste: bool) {
     if !auto_paste {
         return;
     }
-    // Synthesize the paste chord through the compositor (hyprctl), not a wrtype virtual
-    // keyboard. wrtype re-uploads its XKB keymap on the "v" KeyPress, and that upload races the
-    // held-modifier state, so Ctrl+Shift intermittently drops and a bare "v" leaks into the app.
-    // Hyprland's send_shortcut uses the real seat keymap and modifier handling, so it lands intact.
-    let out = std::process::Command::new("hyprctl")
-        .args([
-            "dispatch",
-            r#"hl.dsp.send_shortcut({ mods = "CTRL SHIFT", key = "V", window = "activewindow" })"#,
-        ])
-        .output();
-    match out {
-        Ok(o) => {
-            let reply = String::from_utf8_lossy(&o.stdout);
-            if reply.trim() != "ok" {
-                tracing::error!("paste: hyprctl send_shortcut: {}", reply.trim());
-            }
+    if let Ok(mut guard) = inject().lock() {
+        if let Some(k) = guard.as_mut() {
+            k.paste();
         }
-        Err(e) => tracing::error!("paste: hyprctl spawn failed: {e}"),
     }
 }
 
 pub fn type_enter() {
-    // Enter stays on wrtype — the input-method protocol commits text, not key events, and a
-    // committed "\n" won't trigger submit. Return isn't a bare-key bind, so no collision risk.
-    if let Ok(mut guard) = get_client().lock() {
-        if let Some(client) = guard.as_mut() {
-            if let Err(e) = client.type_key("Return") {
-                tracing::error!("type_enter failed: {e}");
-            }
+    // The input-method protocol commits text, not key events, so a committed "\n" wouldn't submit;
+    // synthesize a real Return instead. Return isn't a bare-key bind, so no collision risk.
+    if let Ok(mut guard) = inject().lock() {
+        if let Some(k) = guard.as_mut() {
+            k.enter();
         }
     }
 }

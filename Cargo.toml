@@ -24,7 +24,7 @@ reqwest = { version = "0.12", features = ["multipart", "json", "socks"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ksni = "0.3.3"
-wrtype = "0.1"
+tempfile = "3"
 smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
 wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
