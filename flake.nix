@@ -68,12 +68,50 @@
           };
         };
 
-      devShells = forAllSystems ({ pkgs }: {
+      devShells = forAllSystems ({ pkgs }: let
+        # `dev` runs the daemon from source: it stops the installed user service first
+        # (one daemon at a time owns the socket, audio device, tray and Fn-key socket),
+        # rebuilds-and-reruns on every save, and restarts the service when you exit.
+        dev = pkgs.writeShellScriptBin "dev" ''
+          set -euo pipefail
+          svc=dictate-desktop
+          was_active=0
+          if systemctl --user is-active --quiet "$svc"; then
+            was_active=1
+            echo "» stopping $svc user service for dev session"
+            systemctl --user stop "$svc"
+          fi
+          restore() {
+            if [ "$was_active" = 1 ]; then
+              echo "» restoring $svc user service"
+              systemctl --user start "$svc"
+            fi
+          }
+          trap restore EXIT
+          cargo watch -x 'run -- daemon'
+        '';
+      in {
         default = pkgs.mkShell {
           nativeBuildInputs = [ pkgs.pkg-config pkgs.mold ];
           buildInputs = [ pkgs.alsa-lib pkgs.openssl pkgs.libxkbcommon pkgs.wayland pkgs.libglvnd ];
+          packages = [ pkgs.cargo-watch pkgs.flac pkgs.jq pkgs.sops dev ];
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.libglvnd pkgs.wayland ]}";
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+          # Load the repo-local API keys at shell entry, so plain `nix develop` is
+          # self-contained (no .envrc required). Decryption is a runtime step — secrets
+          # can never come from Nix evaluation, which would put them in the world-readable
+          # store. Needs your personal age key (riva/watts); absent it, keys just don't load.
+          shellHook = ''
+            if [ -f secrets.yaml ]; then
+              if creds=$(sops -d --output-type json secrets.yaml 2>/dev/null); then
+                eval "$(printf '%s' "$creds" | jq -r 'to_entries[] | "export \(.key)=\(.value | @sh)"')"
+                unset creds
+              else
+                echo "warning: could not decrypt secrets.yaml (age key missing?) — API keys not loaded" >&2
+              fi
+            fi
+            echo "dictate-desktop dev shell — run 'dev' to stop the user service and watch-rebuild (secrets loaded from secrets.yaml)"
+          '';
         };
       });
 
