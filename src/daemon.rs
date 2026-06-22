@@ -173,7 +173,11 @@ async fn finalize_transcript(
         if !is_clipboard && !already_typed {
             // Input method commits the whole string if a field is focused; otherwise it's
             // already on the clipboard, so paste it (or just toast if auto-paste is off).
-            if !output::type_text(&final_text) {
+            let n = final_text.chars().count();
+            if output::type_text(&final_text) {
+                tracing::info!("delivered via input-method ({n} chars)");
+            } else {
+                tracing::info!("input-method inactive → paste fallback (auto_paste={auto_paste}, {n} chars)");
                 output::paste(auto_paste);
                 pasted = true;
             }
@@ -214,7 +218,7 @@ async fn finalize_transcript(
     if pasted {
         overlay.toast(format!(
             "{} · {} chars",
-            if auto_paste { "📋 pasted" } else { "📋 copied — paste manually" },
+            if auto_paste { "pasted" } else { "copied — paste manually" },
             final_text.chars().count()
         ));
     } else {
@@ -1085,7 +1089,7 @@ pub async fn run() -> Result<()> {
                     }
                     tray::TrayCommand::CopyHistory(text) => {
                         output::copy_to_clipboard(&text);
-                        daemon.overlay.toast("📋 copied from history".into());
+                        daemon.overlay.toast("copied from history".into());
                     }
                 }
                 daemon.sync_tray_state();
