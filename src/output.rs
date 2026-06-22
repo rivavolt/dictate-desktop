@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
 use wl_clipboard_rs::copy::{MimeType, Options, Source};
-use wrtype::{Modifier, WrtypeClient};
+use wrtype::WrtypeClient;
 
 use crate::inputmethod;
 
@@ -71,14 +71,27 @@ pub fn paste(auto_paste: bool) {
     // The transcript is already on the clipboard (the caller copied it). Optionally synthesize
     // the paste chord; the daemon shows the toast in the overlay. Only the chord is sent —
     // never per-character typing — so chars can't drop and no bare-key bind can be tripped.
-    if auto_paste {
-        if let Ok(mut guard) = get_client().lock() {
-            if let Some(client) = guard.as_mut() {
-                if let Err(e) = client.send_shortcut(&[Modifier::Ctrl, Modifier::Shift], "v") {
-                    tracing::error!("paste shortcut failed: {e}");
-                }
+    if !auto_paste {
+        return;
+    }
+    // Synthesize the paste chord through the compositor (hyprctl), not a wrtype virtual
+    // keyboard. wrtype re-uploads its XKB keymap on the "v" KeyPress, and that upload races the
+    // held-modifier state, so Ctrl+Shift intermittently drops and a bare "v" leaks into the app.
+    // Hyprland's send_shortcut uses the real seat keymap and modifier handling, so it lands intact.
+    let out = std::process::Command::new("hyprctl")
+        .args([
+            "dispatch",
+            r#"hl.dsp.send_shortcut({ mods = "CTRL SHIFT", key = "V", window = "activewindow" })"#,
+        ])
+        .output();
+    match out {
+        Ok(o) => {
+            let reply = String::from_utf8_lossy(&o.stdout);
+            if reply.trim() != "ok" {
+                tracing::error!("paste: hyprctl send_shortcut: {}", reply.trim());
             }
         }
+        Err(e) => tracing::error!("paste: hyprctl spawn failed: {e}"),
     }
 }
 
