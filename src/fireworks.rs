@@ -55,12 +55,13 @@ pub async fn stream_live(
         .header("Connection", "Upgrade")
         .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
         .header("Sec-WebSocket-Version", "13")
-        .header("Authorization", &api_key)
+        .header("Authorization", format!("Bearer {api_key}"))
         .body(())?;
 
     tracing::debug!("connecting to Fireworks (model: {model}, lang: {})", state.lang);
-    let (ws_stream, _) = connect_async(request)
+    let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(request))
         .await
+        .context("Fireworks WebSocket connect timed out")?
         .context("Fireworks WebSocket connect failed")?;
     tracing::debug!("Fireworks WebSocket connected");
     let (mut ws_tx, mut ws_rx) = ws_stream.split();

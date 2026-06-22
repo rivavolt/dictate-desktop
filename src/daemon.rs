@@ -1,9 +1,10 @@
 use anyhow::Result;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::assemblyai;
 use crate::audio;
 use crate::config::{self, Config, State};
 use crate::correct;
@@ -18,10 +19,69 @@ use crate::sound;
 use crate::transcript::TranscriptEvent;
 use crate::tray;
 
+/// Monotonic id per recording, so each batch capture gets its own temp file.
+static REC_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Peak i16 amplitude below which a capture is treated as silence (no speech) and skipped.
+const SILENCE_PEAK: u16 = 500;
+
+#[derive(serde::Deserialize)]
+struct HistRow {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    latency_ms: u64,
+}
+
+/// Estimate batch transcription latency (seconds) for `provider` at `duration_ms` from recent
+/// history — an affine fit (fixed overhead + per-second rate) over the last samples for this
+/// provider, falling back to the mean, or None when there isn't enough data yet.
+fn estimate_eta(history_jsonl: &std::path::Path, provider: &str, duration_ms: u64) -> Option<f32> {
+    let content = std::fs::read_to_string(history_jsonl).ok()?;
+    let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    for line in content.lines().rev() {
+        let Ok(row) = serde_json::from_str::<HistRow>(line) else {
+            continue;
+        };
+        if row.mode != "batch" || row.latency_ms == 0 {
+            continue;
+        }
+        if config::parse_provider_model(&row.model).0 != provider {
+            continue;
+        }
+        xs.push(row.duration_ms as f64);
+        ys.push(row.latency_ms as f64);
+        if xs.len() >= 20 {
+            break;
+        }
+    }
+    if xs.len() < 2 {
+        return None;
+    }
+    let n = xs.len() as f64;
+    let sx: f64 = xs.iter().sum();
+    let sy: f64 = ys.iter().sum();
+    let sxx: f64 = xs.iter().map(|x| x * x).sum();
+    let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| x * y).sum();
+    let denom = n * sxx - sx * sx;
+    let pred_ms = if denom.abs() < 1.0 {
+        sy / n // all samples ~same duration → mean latency
+    } else {
+        let b = (n * sxy - sx * sy) / denom;
+        let a = (sy - b * sx) / n;
+        a + b * duration_ms as f64
+    };
+    Some((pred_ms / 1000.0).clamp(0.4, 60.0) as f32)
+}
+
 pub(crate) async fn transcribe_with_retry(
     path: &std::path::Path,
     provider: &str,
     lang: &str,
+    languages: &[String],
     model: &str,
 ) -> anyhow::Result<String> {
     let mut last_err = None;
@@ -32,6 +92,7 @@ pub(crate) async fn transcribe_with_retry(
             tokio::time::sleep(delay).await;
         }
         match match provider {
+            "assemblyai" => assemblyai::transcribe_file(path, lang, languages, model).await,
             "groq" => groq::transcribe_file(path, lang, model).await,
             "fireworks" => fireworks::transcribe_file(path, lang, model).await,
             _ => deepgram::transcribe_file(path, lang, model).await,
@@ -52,23 +113,37 @@ async fn finalize_transcript(
     do_correct: bool,
     correct_hold_ms: u64,
     lang: &str,
+    mode: &str,
+    model: &str,
+    latency_ms: u64,
     enter_after: bool,
     is_clipboard: bool,
     already_typed: bool,
+    auto_paste: bool,
     overlay: &overlay::Handle,
     transcript_file: &std::path::Path,
     history_file: &std::path::Path,
     audio_dir: &std::path::Path,
     audio_samples: Option<(&[i16], u32)>,
 ) {
-    // Archive audio with timestamp
+    let raw = transcript.clone();
+    // One instant for this utterance: the compact form names the FLAC, the RFC3339 form is the
+    // JSONL ts — same moment, so the history row and its audio file are linked by construction.
+    let now = chrono::Local::now();
+    let stamp = now.format("%Y%m%d-%H%M%S%.3f").to_string();
+    let iso = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+
+    let mut audio_name: Option<String> = None;
+    let mut duration_ms: u64 = 0;
     if let Some((samples, sample_rate)) = audio_samples {
         if !samples.is_empty() {
+            duration_ms = samples.len() as u64 * 1000 / (sample_rate.max(1)) as u64;
             let _ = fs::create_dir_all(audio_dir);
-            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let path = audio_dir.join(format!("{ts}.flac"));
-            if let Err(e) = audio::save_flac(&path, samples, sample_rate) {
+            let name = format!("{stamp}.flac");
+            if let Err(e) = audio::save_flac(&audio_dir.join(&name), samples, sample_rate) {
                 tracing::warn!("failed to archive audio: {e}");
+            } else {
+                audio_name = Some(name);
             }
         }
     }
@@ -89,11 +164,17 @@ async fn finalize_transcript(
     } else {
         transcript
     };
+    let mut pasted = false;
     if !final_text.is_empty() {
         overlay.set_text(final_text.clone());
         output::copy_to_clipboard(&final_text);
-        if !already_typed && !is_clipboard {
-            output::type_text(&final_text);
+        if !is_clipboard && !already_typed {
+            // Input method commits the whole string if a field is focused; otherwise it's
+            // already on the clipboard, so paste it (or just toast if auto-paste is off).
+            if !output::type_text(&final_text) {
+                output::paste(auto_paste);
+                pasted = true;
+            }
         }
         let _ = std::fs::write(transcript_file, &final_text);
     }
@@ -101,6 +182,26 @@ async fn finalize_transcript(
         output::type_enter();
     }
     output::append_history(history_file, &final_text);
+    if !final_text.is_empty() || audio_name.is_some() {
+        // Structured companion to history.log: links the utterance to its archived audio and
+        // keeps raw-vs-corrected, model, duration, and processing latency (feeds the ETA).
+        let jsonl = history_file.with_file_name("history.jsonl");
+        output::append_history_record(
+            &jsonl,
+            &output::HistoryRecord {
+                ts: &iso,
+                audio: audio_name.as_deref(),
+                mode,
+                model,
+                lang,
+                raw: &raw,
+                text: &final_text,
+                corrected: final_text != raw,
+                duration_ms,
+                latency_ms,
+            },
+        );
+    }
     sound::play_stop();
     // Hold corrected text visible — proportional to length, capped
     if do_correct && !final_text.is_empty() && correct_hold_ms > 0 {
@@ -108,7 +209,15 @@ async fn finalize_transcript(
         let hold = (800 + words * 100).min(correct_hold_ms);
         tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
     }
-    overlay.copied();
+    if pasted {
+        overlay.toast(format!(
+            "{} · {} chars",
+            if auto_paste { "📋 pasted" } else { "📋 copied — paste manually" },
+            final_text.chars().count()
+        ));
+    } else {
+        overlay.copied();
+    }
 }
 
 struct DaemonState {
@@ -150,6 +259,23 @@ impl DaemonState {
         }
     }
 
+    /// Languages the session must handle: the preferred set when auto-detecting, else the
+    /// single chosen language.
+    fn required_langs(&self) -> Vec<String> {
+        if self.state.lang == config::AUTO_LANG {
+            self.state.languages.clone()
+        } else {
+            vec![self.state.lang.clone()]
+        }
+    }
+
+    /// A compatible model for the current mode + languages, if the picked one falls short.
+    fn resolve(&self) -> Option<String> {
+        let req = self.required_langs();
+        let req: Vec<&str> = req.iter().map(String::as_str).collect();
+        config::resolve_model(&self.state.model, &self.state.mode, &req)
+    }
+
     fn start_recording(&mut self) -> Result<String> {
         if self.recording {
             return Ok("already recording".into());
@@ -158,28 +284,43 @@ impl DaemonState {
         self.recording = true;
         fs::write(&self.config.state_file, "recording")?;
         sound::play_start();
-        self.overlay.show();
-        self.overlay.set_info(self.state.mode.clone(), self.state.lang.clone());
+        let overlay_mode = self.state.overlay_mode();
+        if overlay_mode != config::OverlayMode::Off {
+            self.overlay.set_status_only(overlay_mode == config::OverlayMode::Status);
+            self.overlay.show();
+            self.overlay.set_info(self.state.mode.clone(), self.state.lang.clone());
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop.clone());
 
-        if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
-            tracing::info!("{} incompatible with mode={} lang={}, switching to {new_model}",
-                self.state.model, self.state.mode, self.state.lang);
-            self.state.model = new_model;
-            self.state.save(&self.config);
+        // Smart fallback: if the picked model can't handle this mode/languages, use a
+        // compatible one for THIS session only — the explicit pick is preserved.
+        let picked = self.state.model.clone();
+        if let Some(eff) = self.resolve() {
+            tracing::info!(
+                "{picked} can't do mode={} langs={:?}; using {eff} this session",
+                self.state.mode,
+                self.required_langs()
+            );
+            self.state.model = eff;
         }
 
-        let (provider, _model) = config::parse_provider_model(&self.state.model);
+        let (provider, _) = config::parse_provider_model(&self.state.model);
         let provider = provider.to_string();
+        tracing::info!(
+            "recording: mode={} provider={} model={} lang={}",
+            self.state.mode, provider, self.state.model, self.state.lang
+        );
 
-        match self.state.mode.as_str() {
-            "live" => self.start_live(stop, &provider)?,
-            "batch" => self.start_batch(stop, &provider)?,
-            "vad" => self.start_vad(stop, &provider)?,
-            _ => self.start_live(stop, &provider)?,
-        }
+        let result = match self.state.mode.as_str() {
+            "live" => self.start_live(stop, &provider),
+            "batch" => self.start_batch(stop, &provider),
+            "vad" => self.start_vad(stop, &provider),
+            _ => self.start_live(stop, &provider),
+        };
+        self.state.model = picked; // restore explicit pick — the fallback is per-session
+        result?;
 
         Ok(format!("recording ({}, {})", self.state.mode, provider))
     }
@@ -200,19 +341,26 @@ impl DaemonState {
         let history_file = self.config.history_file.clone();
         let audio_dir = self.config.audio_dir.clone();
         let overlay_handle = self.overlay.clone();
+        let mode = self.state.mode.clone();
+        let model = self.state.model.clone();
+        let auto_paste = self.state.auto_paste;
         let state = self.state.clone();
         let provider = provider.to_string();
         self.record_handle = Some(tokio::spawn(async move {
             let event_handler = tokio::spawn(async move {
                 let mut last_accumulated = String::new();
                 let mut last_pending = String::new();
+                // Whether the input method actually took our text (a field was focused). If it
+                // never did, we don't type live — finalize delivers the whole transcript via
+                // clipboard/paste instead (no per-char keystrokes, so nothing drops or trips a bind).
+                let mut ime_used = false;
                 while let Some(event) = rx.recv().await {
                     match event {
                         TranscriptEvent::Final { delta, accumulated } => {
                             tracing::info!("transcript: {delta}");
                             overlay_handle.set_text(accumulated.clone());
-                            if !is_clipboard {
-                                output::type_text(&delta);
+                            if !is_clipboard && output::type_text(&delta) {
+                                ime_used = true;
                             }
                             last_accumulated = accumulated;
                             last_pending.clear();
@@ -230,20 +378,24 @@ impl DaemonState {
                     }
                     last_accumulated.push_str(&last_pending);
                     tracing::info!("transcript (flushed pending): {last_pending}");
-                    if !is_clipboard {
-                        output::type_text(&last_pending);
+                    if !is_clipboard && output::type_text(&last_pending) {
+                        ime_used = true;
                     }
                 }
                 let samples: Vec<i16> = samples_buf.lock().unwrap().clone();
                 finalize_transcript(
                     last_accumulated, do_correct, correct_hold_ms, &lang,
-                    enter_after, is_clipboard, !is_clipboard,
+                    &mode, &model, 0,
+                    enter_after, is_clipboard, ime_used, auto_paste,
                     &overlay_handle, &transcript_file, &history_file,
                     &audio_dir, Some((&samples, sample_rate)),
                 ).await;
             });
 
             let result = match provider.as_str() {
+                "assemblyai" => {
+                    assemblyai::stream_live(&state, audio_rx, stop, sample_rate, tx).await
+                }
                 "fireworks" => {
                     fireworks::stream_live(&state, audio_rx, stop, sample_rate, tx).await
                 }
@@ -261,7 +413,10 @@ impl DaemonState {
     }
 
     fn start_batch(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
-        let audio_file = self.config.audio_file.clone();
+        // Per-session temp file: a shared path lets a fast re-trigger truncate the file
+        // while the previous transcription is still reading it (the `No such file` races).
+        let seq = REC_SEQ.fetch_add(1, Ordering::Relaxed);
+        let audio_file = self.config.audio_file.with_extension(format!("{seq}.wav"));
         let state = self.state.clone();
         let enter_after = self.state.enter;
         let do_correct = self.state.correct;
@@ -287,7 +442,7 @@ impl DaemonState {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
 
-            overlay_handle.processing();
+            overlay_handle.processing(0.0);
 
             if let Err(e) = record.await {
                 tracing::error!("batch record error: {e}");
@@ -303,18 +458,44 @@ impl DaemonState {
                 })
                 .unwrap_or_default();
 
+            // Skip silent/empty captures instead of uploading silence (which the provider
+            // rejects with "no spoken audio"): just dismiss the overlay. Peak amplitude is a
+            // cheap speech proxy — real speech peaks in the thousands, room noise stays low.
+            let peak = samples_for_archive.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            let dur_ms = if archive_rate > 0 {
+                samples_for_archive.len() as u64 * 1000 / archive_rate as u64
+            } else {
+                0
+            };
+            tracing::info!("batch capture: {dur_ms}ms, peak {peak}, provider {provider}");
+            if samples_for_archive.is_empty() || peak < SILENCE_PEAK {
+                tracing::info!("no speech detected (peak {peak} < {SILENCE_PEAK}) — skipping");
+                overlay_handle.copied();
+                let _ = fs::remove_file(&audio_file);
+                return;
+            }
+
+            // Countdown the estimated wait (rolling per-provider latency vs this clip's length).
+            let jsonl = history_file.with_file_name("history.jsonl");
+            let eta = estimate_eta(&jsonl, &provider, dur_ms).unwrap_or(0.0);
+            overlay_handle.processing(eta);
+
             let (_, model) = config::parse_provider_model(&state.model);
-            let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, model).await {
+            let t0 = std::time::Instant::now();
+            let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, &state.languages, model).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("batch transcribe error: {e}");
                     String::new()
                 }
             };
+            let latency_ms = t0.elapsed().as_millis() as u64;
+            tracing::info!("transcribed in {latency_ms}ms ({} chars) via {}", transcript.len(), state.model);
 
             finalize_transcript(
                 transcript, do_correct, correct_hold_ms, &lang,
-                enter_after, is_clipboard, false,
+                &state.mode, &state.model, latency_ms,
+                enter_after, is_clipboard, false, state.auto_paste,
                 &overlay_handle, &transcript_file, &history_file,
                 &audio_dir, Some((&samples_for_archive, archive_rate)),
             ).await;
@@ -357,7 +538,8 @@ impl DaemonState {
             let samples: Vec<i16> = samples_buf.lock().unwrap().clone();
             finalize_transcript(
                 full_transcript, do_correct, correct_hold_ms, &lang,
-                enter_after, is_clipboard, !is_clipboard,
+                &state.mode, &state.model, 0,
+                enter_after, is_clipboard, false, state.auto_paste,
                 &overlay_handle, &transcript_file, &history_file,
                 &audio_dir, Some((&samples, sample_rate)),
             ).await;
@@ -413,20 +595,28 @@ impl DaemonState {
             "status" => {
                 let status = if self.recording { "recording" } else { "idle" };
                 ipc::Response::ok(format!(
-                    "{} (mode: {}, output: {}, lang: {}, model: {})",
-                    status, self.state.mode, self.state.output, self.state.lang, self.state.model
+                    "{} (mode: {}, output: {}, overlay: {}, lang: {}, model: {}, preferred: [{}])",
+                    status, self.state.mode, self.state.output,
+                    self.state.overlay_mode().name(),
+                    self.state.lang, self.state.model,
+                    self.state.languages.join(", ")
                 ))
             }
             "mode" => {
                 if let Some(m) = req.arg {
                     if ["live", "vad", "batch"].contains(&m.as_str()) {
                         self.state.mode = m.clone();
-                        let mut msg = format!("mode: {m}");
-                        if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
-                            self.state.model = new_model.clone();
-                            msg.push_str(&format!(" (switched model to {new_model})"));
-                        }
+                        // Re-derive the overlay default for the new mode (batch shows it,
+                        // live/vad direct-typing hides it).
+                        self.state.overlay = None;
                         self.state.save(&self.config);
+                        let mut msg = format!("mode: {m}");
+                        if let Some(eff) = self.resolve() {
+                            msg.push_str(&format!(
+                                " ({} can't do this mode/langs — will use {eff})",
+                                self.state.model
+                            ));
+                        }
                         ipc::Response::ok(msg)
                     } else {
                         ipc::Response::err(format!("invalid mode '{}'. use: live, vad, batch", m))
@@ -442,13 +632,12 @@ impl DaemonState {
                 if let Some(l) = req.arg {
                     let lang = if l == "multi" { config::AUTO_LANG.to_string() } else { l };
                     self.state.lang = lang.clone();
+                    self.state.save(&self.config);
                     let label = config::lang_name(&lang).unwrap_or(&lang);
                     let mut msg = format!("language: {label} ({lang})");
-                    if let Some(new_model) = config::resolve_model(&self.state.model, &self.state.mode, &self.state.lang) {
-                        self.state.model = new_model.clone();
-                        msg.push_str(&format!(" (switched model to {new_model})"));
+                    if let Some(eff) = self.resolve() {
+                        msg.push_str(&format!(" ({} can't do this — will use {eff})", self.state.model));
                     }
-                    self.state.save(&self.config);
                     ipc::Response::ok(msg)
                 } else {
                     let current = match config::lang_name(&self.state.lang) {
@@ -463,6 +652,34 @@ impl DaemonState {
                         .collect::<Vec<_>>()
                         .join("\n");
                     ipc::Response::ok(format!("language: {current}\navailable:\n{list}"))
+                }
+            }
+            "languages" => {
+                if let Some(list) = req.arg {
+                    let langs: Vec<String> = list
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let invalid: Vec<&str> = langs
+                        .iter()
+                        .filter(|c| c.as_str() == config::AUTO_LANG || config::lang_name(c).is_none())
+                        .map(|s| s.as_str())
+                        .collect();
+                    if langs.is_empty() {
+                        ipc::Response::err("provide at least one language code")
+                    } else if !invalid.is_empty() {
+                        ipc::Response::err(format!("invalid language code(s): {}", invalid.join(", ")))
+                    } else {
+                        self.state.languages = langs.clone();
+                        self.state.save(&self.config);
+                        ipc::Response::ok(format!("preferred languages: {}", langs.join(", ")))
+                    }
+                } else {
+                    ipc::Response::ok(format!(
+                        "preferred languages: {}\n(candidate set for auto-detect where supported — currently AssemblyAI batch)",
+                        self.state.languages.join(", ")
+                    ))
                 }
             }
             "font" => {
@@ -554,8 +771,14 @@ impl DaemonState {
                 if let Some(o) = req.arg {
                     if ["type", "clipboard"].contains(&o.as_str()) {
                         self.state.output = o.clone();
+                        // Drop any explicit override so the overlay follows the new mode's
+                        // default (off for type, on for clipboard).
+                        self.state.overlay = None;
                         self.state.save(&self.config);
-                        ipc::Response::ok(format!("output: {}", o))
+                        ipc::Response::ok(format!(
+                            "output: {o} (overlay: {})",
+                            self.state.overlay_mode().name()
+                        ))
                     } else {
                         ipc::Response::err(format!("invalid output '{}'. use: type, clipboard", o))
                     }
@@ -566,6 +789,28 @@ impl DaemonState {
                     ))
                 }
             }
+            "overlay" => match req.arg.as_deref() {
+                None => ipc::Response::ok(format!(
+                    "overlay: {} (off | status | full)",
+                    self.state.overlay_mode().name()
+                )),
+                Some(s) => {
+                    let mode = match s {
+                        "off" => Some(config::OverlayMode::Off),
+                        "status" => Some(config::OverlayMode::Status),
+                        "full" => Some(config::OverlayMode::Full),
+                        _ => None,
+                    };
+                    match mode {
+                        Some(m) => {
+                            self.state.overlay = Some(m);
+                            self.state.save(&self.config);
+                            ipc::Response::ok(format!("overlay: {}", m.name()))
+                        }
+                        None => ipc::Response::err("invalid value. use: off, status, full"),
+                    }
+                }
+            },
             "input" => {
                 if let Some(name) = req.arg {
                     if name == "default" {
@@ -629,10 +874,13 @@ impl DaemonState {
                     }
                     let caps = config::model_caps(provider, model);
                     let mut warnings = Vec::new();
-                    if self.state.mode == "live" && !caps.live {
-                        warnings.push(format!("no live support, will resolve on record"));
+                    if self.state.mode == "live" && caps.live.is_none() {
+                        warnings.push("no live support, will fall back on record".to_string());
                     }
-                    if caps.lang == config::LangSupport::EnglishOnly && self.state.lang != "en" {
+                    if config::is_english_only(&caps)
+                        && self.state.lang != "en"
+                        && self.state.lang != config::AUTO_LANG
+                    {
                         warnings.push("english only".into());
                     }
                     self.state.model = m.clone();
@@ -648,9 +896,9 @@ impl DaemonState {
                         let (p, n) = config::parse_provider_model(m);
                         let caps = config::model_caps(p, n);
                         let mut tags = Vec::new();
-                        if caps.live { tags.push("live"); }
-                        if caps.batch { tags.push("batch"); }
-                        if caps.lang == config::LangSupport::EnglishOnly { tags.push("en-only"); }
+                        if caps.live.is_some() { tags.push("live"); }
+                        if caps.batch.is_some() { tags.push("batch"); }
+                        if config::is_english_only(&caps) { tags.push("en-only"); }
                         let current = if *m == self.state.model { " *" } else { "" };
                         format!("  {m} [{tags}]{current}", tags = tags.join("+"))
                     }).collect::<Vec<_>>().join("\n");
@@ -660,6 +908,65 @@ impl DaemonState {
                     ))
                 }
             }
+            "vocab" => {
+                let arg = req.arg.unwrap_or_else(|| "list".into());
+                let mut lines = arg.split('\n');
+                let action = lines.next().unwrap_or("list");
+                let terms: Vec<String> =
+                    lines.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                match action {
+                    "add" => {
+                        for t in terms {
+                            if !self.state.vocabulary.contains(&t) {
+                                self.state.vocabulary.push(t);
+                            }
+                        }
+                        self.state.save(&self.config);
+                        ipc::Response::ok(format!("vocabulary: {} term(s)", self.state.vocabulary.len()))
+                    }
+                    "remove" => {
+                        self.state.vocabulary.retain(|t| !terms.contains(t));
+                        self.state.save(&self.config);
+                        ipc::Response::ok(format!("vocabulary: {} term(s)", self.state.vocabulary.len()))
+                    }
+                    "clear" => {
+                        self.state.vocabulary.clear();
+                        self.state.save(&self.config);
+                        ipc::Response::ok("vocabulary cleared")
+                    }
+                    _ => {
+                        if self.state.vocabulary.is_empty() {
+                            ipc::Response::ok("vocabulary: (empty)")
+                        } else {
+                            ipc::Response::ok(format!(
+                                "vocabulary ({}):\n  {}",
+                                self.state.vocabulary.len(),
+                                self.state.vocabulary.join("\n  ")
+                            ))
+                        }
+                    }
+                }
+            }
+            "fillers" => {
+                match req.arg.as_deref() {
+                    Some("on") => self.state.remove_fillers = true,
+                    Some("off") => self.state.remove_fillers = false,
+                    None => self.state.remove_fillers = !self.state.remove_fillers,
+                    Some(_) => return ipc::Response::err("use: on, off"),
+                }
+                self.state.save(&self.config);
+                ipc::Response::ok(format!("filler removal: {}", if self.state.remove_fillers { "on" } else { "off" }))
+            }
+            "paste" => {
+                match req.arg.as_deref() {
+                    Some("on") => self.state.auto_paste = true,
+                    Some("off") => self.state.auto_paste = false,
+                    None => self.state.auto_paste = !self.state.auto_paste,
+                    Some(_) => return ipc::Response::err("use: on, off"),
+                }
+                self.state.save(&self.config);
+                ipc::Response::ok(format!("auto-paste: {}", if self.state.auto_paste { "on" } else { "off" }))
+            }
             other => ipc::Response::err(format!("unknown command: {}", other)),
         }
     }
@@ -668,6 +975,9 @@ impl DaemonState {
 pub async fn run() -> Result<()> {
     let config = Config::new();
     let state = State::load(&config);
+
+    // Start the input-method client up front (see output.rs).
+    output::init();
 
     let (tray_tx, mut tray_rx) = mpsc::channel::<tray::TrayCommand>(16);
     let tray_handle = match tray::spawn(tray_tx, &state).await {
@@ -738,8 +1048,17 @@ pub async fn run() -> Result<()> {
                     tray::TrayCommand::SetOutput(o) => {
                         daemon.handle_command(ipc::Request { command: "output".into(), arg: Some(o) });
                     }
-                    tray::TrayCommand::SetLang(l) => {
-                        daemon.handle_command(ipc::Request { command: "lang".into(), arg: Some(l) });
+                    tray::TrayCommand::ToggleLang(code) => {
+                        if let Some(pos) = daemon.state.languages.iter().position(|c| c == &code) {
+                            if daemon.state.languages.len() > 1 {
+                                daemon.state.languages.remove(pos);
+                            }
+                        } else {
+                            daemon.state.languages.push(code);
+                        }
+                        // Curating the set implies detect-among-it.
+                        daemon.state.lang = config::AUTO_LANG.to_string();
+                        daemon.state.save(&daemon.config);
                     }
                     tray::TrayCommand::SetModel(m) => {
                         daemon.handle_command(ipc::Request { command: "model".into(), arg: Some(m) });
@@ -753,13 +1072,26 @@ pub async fn run() -> Result<()> {
                     tray::TrayCommand::ToggleCorrect => {
                         daemon.handle_command(ipc::Request { command: "correct".into(), arg: None });
                     }
+                    tray::TrayCommand::ToggleFillers => {
+                        daemon.handle_command(ipc::Request { command: "fillers".into(), arg: None });
+                    }
+                    tray::TrayCommand::ToggleAutoPaste => {
+                        daemon.handle_command(ipc::Request { command: "paste".into(), arg: None });
+                    }
+                    tray::TrayCommand::SetOverlay(m) => {
+                        daemon.handle_command(ipc::Request { command: "overlay".into(), arg: Some(m) });
+                    }
+                    tray::TrayCommand::CopyHistory(text) => {
+                        output::copy_to_clipboard(&text);
+                        daemon.overlay.toast("📋 copied from history".into());
+                    }
                 }
                 daemon.sync_tray_state();
             }
             Some(ev) = fn_rx.recv() => {
                 match ev {
                     fnkey::KeyEvent::Start => {
-                        let _ = daemon.toggle_recording();
+                        let _ = daemon.start_recording();
                     }
                     fnkey::KeyEvent::Release => {
                         if daemon.recording {

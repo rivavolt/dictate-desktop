@@ -46,11 +46,17 @@ pub enum Command {
     Show,
     SetText(String),
     SetPending(String),
-    Processing,
+    /// Enter the processing state; the f32 is the estimated seconds until the transcript
+    /// lands (0 = unknown → plain pulsing dot, no countdown).
+    Processing(f32),
     Copied,
+    /// Briefly show a one-line message (paste/copy feedback) for ~2.5s, regardless of mode.
+    Toast(String),
     Correcting,
     SetInfo(String, String),
     SetFont(String),
+    /// Status-only: show the pill/animations but never expand into the text panel.
+    SetStatusOnly(bool),
 }
 
 #[derive(Clone)]
@@ -72,12 +78,16 @@ impl Handle {
         let _ = self.tx.send(Command::SetPending(text));
     }
 
-    pub fn processing(&self) {
-        let _ = self.tx.send(Command::Processing);
+    pub fn processing(&self, eta_secs: f32) {
+        let _ = self.tx.send(Command::Processing(eta_secs));
     }
 
     pub fn copied(&self) {
         let _ = self.tx.send(Command::Copied);
+    }
+
+    pub fn toast(&self, msg: String) {
+        let _ = self.tx.send(Command::Toast(msg));
     }
 
     pub fn correcting(&self) {
@@ -90,6 +100,10 @@ impl Handle {
 
     pub fn set_font(&self, name: String) {
         let _ = self.tx.send(Command::SetFont(name));
+    }
+
+    pub fn set_status_only(&self, status_only: bool) {
+        let _ = self.tx.send(Command::SetStatusOnly(status_only));
     }
 
     pub fn audio_level(&self) -> &Arc<AtomicU32> {
@@ -223,9 +237,12 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         listening: false,
         processing: false,
         correcting: false,
+        status_only: false,
         shrink_t: 0.0,
         shrink_target: 0.0,
         pill_countdown: 0.0,
+        eta_remaining: 0.0,
+        toast_remaining: 0.0,
         content_pw: 0.0,
         render_w: 0.0,
         anim_phase: 0.0,
@@ -279,6 +296,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.shrink_t = 1.0;
                     state.shrink_target = 1.0;
                     state.pill_countdown = 0.0;
+                    state.eta_remaining = 0.0;
                     state.text.clear();
                     state.pending.clear();
                     state.wrapped_dirty = true;
@@ -300,40 +318,46 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.resize_and_redraw();
                 }
                 Command::SetText(text) => {
-                    if state.listening || state.processing {
-                        state.shrink_target = 0.0;
-                    }
-                    state.listening = false;
-                    state.processing = false;
-                    if state.correcting && state.text != text {
-                        // Corrected text arrived — crossfade from 0
-                        state.correct_fade = 0.0;
-                    }
-                    state.text = text;
-                    state.pending.clear();
-                    state.wrapped_dirty = true;
-                    state.update_reveal();
-                    state.update_finalize();
-                    if state.visible {
-                        state.resize_and_redraw();
+                    // Status-only keeps the pill — ignore transcript text entirely.
+                    if !state.status_only {
+                        if state.listening || state.processing {
+                            state.shrink_target = 0.0;
+                        }
+                        state.listening = false;
+                        state.processing = false;
+                        if state.correcting && state.text != text {
+                            // Corrected text arrived — crossfade from 0
+                            state.correct_fade = 0.0;
+                        }
+                        state.text = text;
+                        state.pending.clear();
+                        state.wrapped_dirty = true;
+                        state.update_reveal();
+                        state.update_finalize();
+                        if state.visible {
+                            state.resize_and_redraw();
+                        }
                     }
                 }
                 Command::SetPending(text) => {
-                    if state.listening || state.processing {
-                        state.shrink_target = 0.0;
-                    }
-                    state.listening = false;
-                    state.processing = false;
-                    state.pending = text;
-                    state.wrapped_dirty = true;
-                    state.update_reveal();
-                    if state.visible {
-                        state.resize_and_redraw();
+                    if !state.status_only {
+                        if state.listening || state.processing {
+                            state.shrink_target = 0.0;
+                        }
+                        state.listening = false;
+                        state.processing = false;
+                        state.pending = text;
+                        state.wrapped_dirty = true;
+                        state.update_reveal();
+                        if state.visible {
+                            state.resize_and_redraw();
+                        }
                     }
                 }
-                Command::Processing => {
+                Command::Processing(eta) => {
                     state.listening = false;
                     state.processing = true;
+                    state.eta_remaining = eta;
                     state.shrink_target = 1.0;
                     state.resize_and_redraw();
                 }
@@ -350,6 +374,25 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                         state.resize_and_redraw();
                     }
                 }
+                Command::Toast(msg) => {
+                    // Show a brief one-line message in the text panel even in status-only mode
+                    // (paste/copy feedback). Auto-dismisses via toast_remaining in the tick.
+                    state.visible = true;
+                    state.fade_target = 1.0;
+                    state.listening = false;
+                    state.processing = false;
+                    state.correcting = false;
+                    state.pill_countdown = 0.0;
+                    state.eta_remaining = 0.0;
+                    state.shrink_target = 0.0;
+                    state.text = msg;
+                    state.pending.clear();
+                    state.wrapped_dirty = true;
+                    state.update_reveal();
+                    state.update_finalize();
+                    state.toast_remaining = 2.5;
+                    state.resize_and_redraw();
+                }
                 Command::Correcting => {
                     state.correcting = true;
                     state.correct_fade = 1.0; // text stays visible initially
@@ -358,6 +401,9 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                 Command::SetInfo(mode, lang) => {
                     state.mode = mode;
                     state.lang = lang;
+                }
+                Command::SetStatusOnly(v) => {
+                    state.status_only = v;
                 }
                 Command::SetFont(name) => {
                     match find_font_path(&name) {
@@ -409,9 +455,12 @@ struct State {
     listening: bool,
     processing: bool,
     correcting: bool,
+    status_only: bool,
     shrink_t: f32,
     shrink_target: f32,
     pill_countdown: f32,
+    eta_remaining: f32,
+    toast_remaining: f32,
     content_pw: f32,
     render_w: f32,
     anim_phase: f32,
@@ -532,6 +581,18 @@ impl State {
         }
 
         // Pulse animation for listening/processing/correcting indicator
+        if self.processing && self.eta_remaining > 0.0 {
+            self.eta_remaining = (self.eta_remaining - dt / 1000.0).max(0.0);
+        }
+        if self.toast_remaining > 0.0 {
+            self.toast_remaining -= dt / 1000.0;
+            if self.toast_remaining <= 0.0 {
+                self.toast_remaining = 0.0;
+                self.text.clear();
+                self.wrapped_dirty = true;
+                self.fade_target = 0.0;
+            }
+        }
         if self.listening || self.processing || self.correcting {
             self.anim_phase += std::f32::consts::TAU * dt / 1000.0;
             needs_redraw = true;
@@ -890,11 +951,23 @@ impl State {
 
             if self.processing {
                 let a = pulse * pill_alpha;
-                let radius = icon_area * 0.25;
-                let mut circle = Path::new();
-                circle.circle(cx, cy, radius);
-                let paint = Paint::color(Color::rgbaf(0.85, 0.85, 0.85, a));
-                self.canvas.fill_path(&circle, &paint);
+                if self.eta_remaining > 0.0 {
+                    // ETA countdown: estimated whole seconds until the transcript lands.
+                    let label = format!("{}", self.eta_remaining.ceil() as u32);
+                    let label_size = rh * 0.4;
+                    let mut paint = Paint::color(Color::rgbaf(0.9, 0.9, 0.9, a));
+                    paint.set_font(&[self.font_id]);
+                    paint.set_font_size(label_size);
+                    paint.set_text_baseline(Baseline::Middle);
+                    let tw = self.measure_text_width(&label, label_size);
+                    let _ = self.canvas.fill_text(cx - tw / 2.0, cy, &label, &paint);
+                } else {
+                    let radius = icon_area * 0.25;
+                    let mut circle = Path::new();
+                    circle.circle(cx, cy, radius);
+                    let paint = Paint::color(Color::rgbaf(0.85, 0.85, 0.85, a));
+                    self.canvas.fill_path(&circle, &paint);
+                }
             } else if is_recording_pill {
                 let a = pulse * pill_alpha;
                 let show_label = self.listening && !self.lang.is_empty() && self.lang != "auto";

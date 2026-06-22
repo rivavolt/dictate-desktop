@@ -1,98 +1,78 @@
-use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixStream;
+use anyhow::{Context, Result};
+use evdev::{Device, EventType, Key};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-/// Key events sent from keyd to the daemon
+/// Key events sent from the hotkey watcher to the daemon.
 pub enum KeyEvent {
-    /// Start recording (hold began or double-tap toggle)
+    /// Trigger pressed — begin recording (push-to-talk).
     Start,
-    /// Stop recording (hold released)
+    /// Trigger released — stop recording.
     Release,
 }
 
+/// The push-to-talk trigger key. Defaults to Fn/Globe (`KEY_FN`), which the Apple
+/// internal keyboard emits as a normal press/release at the evdev layer. Override with
+/// `DICTATE_TRIGGER` for keyboards without a usable Fn key.
+fn trigger_key() -> Key {
+    match std::env::var("DICTATE_TRIGGER").as_deref() {
+        Ok("f24") => Key::KEY_F24,
+        Ok("rightalt") => Key::KEY_RIGHTALT,
+        Ok("rightctrl") => Key::KEY_RIGHTCTRL,
+        Ok("rightmeta") => Key::KEY_RIGHTMETA,
+        Ok("compose") | Ok("menu") => Key::KEY_COMPOSE,
+        _ => Key::KEY_FN,
+    }
+}
+
+/// Watch the trigger key for press/release and forward push-to-talk events. We only
+/// read the device (never grab it), so the key keeps working normally for everything
+/// else — and a bare Fn press does nothing in the compositor anyway.
 pub async fn watch_fn_key(tx: mpsc::Sender<KeyEvent>) -> Result<()> {
-    let combo_name = match std::env::var("DICTATE_TRIGGER").as_deref() {
-        Ok("d") => "fn+d",
-        Ok("f") => "fn+f",
-        Ok("space") => "fn+space",
-        _ => "fn+d",
-    };
-
-    let socket_path = keyd_socket_path();
-    tracing::info!("connecting to keyd at {socket_path}, watching for {combo_name}");
-
+    let key = trigger_key();
     loop {
-        match connect_and_watch(&socket_path, combo_name, &tx).await {
-            Ok(()) => break,
-            Err(e) => {
-                tracing::warn!("keyd connection error: {e}, reconnecting in 2s");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+        if let Err(e) = watch_once(key, &tx).await {
+            tracing::warn!("hotkey watcher error: {e}, retrying in 2s");
         }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-
-    Ok(())
 }
 
-async fn connect_and_watch(
-    socket_path: &str,
-    combo_name: &str,
-    tx: &mpsc::Sender<KeyEvent>,
-) -> Result<()> {
-    let stream = UnixStream::connect(socket_path).await?;
-    let reader = BufReader::new(stream);
-    let mut lines = reader.lines();
-
-    let mut active = false;
-
-    while let Some(line) = lines.next_line().await? {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-
-        let Some(combo) = msg.get("combo").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if combo != combo_name {
-            continue;
-        }
-
-        let Some(event) = msg.get("event").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        match event {
-            "hold_start" => {
-                if !active {
-                    active = true;
-                    let _ = tx.send(KeyEvent::Start).await;
-                } else {
-                    // Toggle off on second activation
-                    active = false;
-                    let _ = tx.send(KeyEvent::Release).await;
-                }
-            }
-            "hold_end" => {
-                if active {
-                    active = false;
-                    let _ = tx.send(KeyEvent::Release).await;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
+/// First input device that advertises the trigger key. `KEY_FN` is unique to the
+/// Apple keyboard; common fallback triggers may match several devices, so we take the first.
+fn find_device(key: Key) -> Option<(PathBuf, Device)> {
+    let mut candidates: Vec<(PathBuf, Device)> = evdev::enumerate()
+        .filter(|(_, dev)| dev.supported_keys().map_or(false, |keys| keys.contains(key)))
+        .collect();
+    // Prefer keyd's virtual keyboard: when keyd grabs the physical device and remaps the
+    // trigger (Fn→F24), the remapped key only surfaces on keyd's output — the physical
+    // device is grabbed and yields nothing.
+    candidates.sort_by_key(|(_, dev)| {
+        let is_keyd = dev.name().map_or(false, |n| n.to_lowercase().contains("keyd"));
+        u8::from(!is_keyd)
+    });
+    candidates.into_iter().next()
 }
 
-fn keyd_socket_path() -> String {
-    if let Ok(path) = std::env::var("KEYD_SOCKET") {
-        return path;
-    }
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        format!("{xdg}/keyd.sock")
-    } else {
-        "/tmp/keyd.sock".to_string()
+async fn watch_once(key: Key, tx: &mpsc::Sender<KeyEvent>) -> Result<()> {
+    let (path, device) =
+        find_device(key).with_context(|| format!("no input device exposes {key:?}"))?;
+    tracing::info!("watching {} for {key:?} (push-to-talk)", path.display());
+
+    let mut events = device.into_event_stream()?;
+    loop {
+        let ev = events.next_event().await?;
+        if ev.event_type() != EventType::KEY || ev.code() != key.code() {
+            continue;
+        }
+        match ev.value() {
+            1 => {
+                let _ = tx.send(KeyEvent::Start).await;
+            }
+            0 => {
+                let _ = tx.send(KeyEvent::Release).await;
+            }
+            _ => {} // 2 = autorepeat while held — ignore
+        }
     }
 }

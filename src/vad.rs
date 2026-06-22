@@ -118,6 +118,7 @@ pub async fn stream_vad(
                                 &chunk_file,
                                 provider,
                                 &state.lang,
+                                &state.languages,
                                 &model,
                                 &overlay,
                                 &state.output,
@@ -146,6 +147,7 @@ pub async fn stream_vad(
             &chunk_file,
             provider,
             &state.lang,
+            &state.languages,
             &model,
             &overlay,
             &state.output,
@@ -164,9 +166,10 @@ async fn transcribe_chunk(
     chunk_file: &PathBuf,
     provider: &str,
     lang: &str,
+    languages: &[String],
     model: &str,
     overlay: &overlay::Handle,
-    output_mode: &str,
+    _output_mode: &str,
     transcript_file: &PathBuf,
     full_transcript: &mut String,
 ) {
@@ -176,18 +179,17 @@ async fn transcribe_chunk(
         return;
     }
 
-    overlay.processing();
+    overlay.processing(0.0);
 
-    match daemon::transcribe_with_retry(chunk_file, provider, lang, model).await {
+    match daemon::transcribe_with_retry(chunk_file, provider, lang, languages, model).await {
         Ok(transcript) if !transcript.is_empty() => {
             if !full_transcript.is_empty() && !full_transcript.ends_with(' ') {
                 full_transcript.push(' ');
             }
             full_transcript.push_str(&transcript);
             output::copy_to_clipboard(full_transcript);
-            if output_mode != "clipboard" {
-                output::type_text(&transcript);
-            }
+            // Delivery happens once in finalize (input-method commit or clipboard paste), so it
+            // works in apps without Wayland text-input — no per-chunk char typing here.
             let _ = tokio::fs::write(transcript_file, full_transcript.as_str()).await;
             overlay.set_text(full_transcript.clone());
         }

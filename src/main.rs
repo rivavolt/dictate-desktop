@@ -1,3 +1,4 @@
+mod assemblyai;
 mod audio;
 mod config;
 mod correct;
@@ -6,6 +7,7 @@ mod deepgram;
 mod fireworks;
 mod fnkey;
 mod groq;
+mod inputmethod;
 mod ipc;
 mod output;
 mod overlay;
@@ -68,13 +70,56 @@ enum Commands {
     Font { font: Option<String> },
     /// Set or show audio input device
     Input { device: Option<String> },
-    /// Set or show model (provider/model). Providers: deepgram, groq, fireworks
+    /// Set or show model (provider/model). Providers: assemblyai, deepgram, groq, fireworks
     Model {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(config::ALL_MODELS))]
         model: Option<String>,
     },
+    /// Set or show preferred languages (candidate set for auto-detect; passed to APIs that support it, e.g. AssemblyAI batch)
+    Languages {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(config::LANGUAGES.iter().filter(|(c, _)| *c != config::AUTO_LANG).map(|(c, _)| *c)))]
+        langs: Vec<String>,
+    },
+    /// Set or show the overlay (off, status, full). status = recording animation only, no text panel
+    Overlay {
+        #[arg(value_parser = ["off", "status", "full"])]
+        mode: Option<String>,
+    },
+    /// Manage custom vocabulary (keyterm boosting): improves recognition of names/jargon/terms
+    Vocab {
+        #[command(subcommand)]
+        action: Option<VocabAction>,
+    },
+    /// Toggle or set provider-side filler-word (um/uh) removal (on, off)
+    Fillers {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+    /// Toggle or set auto-paste fallback (on, off). For apps without Wayland input-method
+    /// support (kitty/TUIs, XWayland): on = paste via Ctrl+Shift+V, off = copy + toast only
+    Paste {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+    /// Show recent transcription history (most recent last)
+    History {
+        /// How many recent entries to show (default 20)
+        count: Option<usize>,
+    },
     /// Generate shell completions
     Completions { shell: Shell },
+}
+
+#[derive(Subcommand)]
+enum VocabAction {
+    /// Add one or more terms (quote multi-word terms)
+    Add { terms: Vec<String> },
+    /// Remove one or more terms
+    Remove { terms: Vec<String> },
+    /// List current vocabulary
+    List,
+    /// Remove all terms
+    Clear,
 }
 
 #[tokio::main]
@@ -94,6 +139,23 @@ async fn main() -> Result<()> {
                 )
                 .init();
             daemon::run().await
+        }
+        Commands::History { count } => {
+            // Read the structured history directly (no daemon round-trip needed).
+            let config = config::Config::new();
+            let path = config.history_file.with_file_name("history.jsonl");
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<&str> = content.lines().collect();
+            let n = count.unwrap_or(20).min(lines.len());
+            for line in &lines[lines.len() - n..] {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+                    let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                    let ts = ts.split('.').next().unwrap_or(ts).replace('T', " ");
+                    println!("{ts}  {text}");
+                }
+            }
+            Ok(())
         }
         cmd => {
             let config = config::Config::new();
@@ -150,7 +212,33 @@ async fn main() -> Result<()> {
                     command: "model".into(),
                     arg: model,
                 },
-                Commands::Daemon | Commands::Completions { .. } => unreachable!(),
+                Commands::Languages { langs } => ipc::Request {
+                    command: "languages".into(),
+                    arg: if langs.is_empty() { None } else { Some(langs.join(",")) },
+                },
+                Commands::Overlay { mode } => ipc::Request {
+                    command: "overlay".into(),
+                    arg: mode,
+                },
+                Commands::Vocab { action } => ipc::Request {
+                    command: "vocab".into(),
+                    // Encode action + terms newline-separated so multi-word terms survive.
+                    arg: Some(match action {
+                        Some(VocabAction::Add { terms }) => format!("add\n{}", terms.join("\n")),
+                        Some(VocabAction::Remove { terms }) => format!("remove\n{}", terms.join("\n")),
+                        Some(VocabAction::Clear) => "clear".into(),
+                        Some(VocabAction::List) | None => "list".into(),
+                    }),
+                },
+                Commands::Fillers { state } => ipc::Request {
+                    command: "fillers".into(),
+                    arg: state,
+                },
+                Commands::Paste { state } => ipc::Request {
+                    command: "paste".into(),
+                    arg: state,
+                },
+                Commands::Daemon | Commands::Completions { .. } | Commands::History { .. } => unreachable!(),
             };
 
             let resp = ipc::send(&config.socket_path, &req).await?;

@@ -27,6 +27,7 @@ ksni = "0.3.3"
 wrtype = "0.1"
 smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
 wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 wl-clipboard-rs = "0.9"
@@ -35,6 +36,7 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 wayland-egl = "0.32"
 toml = "0.8"
 earshot = "1.0"
+evdev = { version = "0.12", features = ["tokio"] }
 resvg = { version = "0.44", default-features = false }
 
 [profile.release]

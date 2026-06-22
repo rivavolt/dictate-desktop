@@ -3,75 +3,96 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-pub const PROVIDERS: &[&str] = &["deepgram", "groq", "fireworks"];
+pub const PROVIDERS: &[&str] = &["assemblyai", "deepgram", "groq", "fireworks"];
 
 pub const AUTO_LANG: &str = "auto";
 
+/// Language coverage of a model in one mode, matched to what our request code actually
+/// sends (verified against each provider's 2026 docs — see the per-model notes below).
 #[derive(Clone, Copy, PartialEq)]
-pub enum LangSupport {
-    All,
-    EnglishOnly,
+pub enum LangCoverage {
+    English,                      // English only
+    Set(&'static [&'static str]), // code-switch / auto-detect among these codes
+    All,                          // ~99 languages, auto-detect, any mix
+}
+
+impl LangCoverage {
+    /// Whether this coverage can handle every required language together ("auto" is a
+    /// wildcard — it just means "detect", which any coverage can do for its own set).
+    pub fn covers(&self, required: &[&str]) -> bool {
+        match self {
+            LangCoverage::All => true,
+            LangCoverage::English => required.iter().all(|l| *l == "en" || *l == AUTO_LANG),
+            LangCoverage::Set(s) => required.iter().all(|l| *l == AUTO_LANG || s.contains(l)),
+        }
+    }
 }
 
 pub struct ModelCaps {
-    pub live: bool,
-    pub batch: bool,
-    pub lang: LangSupport,
+    pub live: Option<LangCoverage>,  // None = no streaming
+    pub batch: Option<LangCoverage>, // None = no file/batch
+    pub rank: u32,                   // fallback preference, lower = preferred
 }
+
+impl ModelCaps {
+    pub fn coverage(&self, mode: &str) -> Option<LangCoverage> {
+        if mode == "live" { self.live } else { self.batch }
+    }
+}
+
+/// True if the model handles only English in every mode it supports.
+pub fn is_english_only(caps: &ModelCaps) -> bool {
+    let eng = |c: &Option<LangCoverage>| matches!(c, None | Some(LangCoverage::English));
+    (caps.live.is_some() || caps.batch.is_some()) && eng(&caps.live) && eng(&caps.batch)
+}
+
+// AssemblyAI u3-rt-pro streaming code-switch set.
+const AAI_EUR6: &[&str] = &["en", "es", "de", "fr", "pt", "it"];
+// Deepgram nova multilingual (`language=multi`) set — what our deepgram path sends for auto.
+const DG_MULTI10: &[&str] = &["en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"];
 
 pub fn model_caps(provider: &str, model: &str) -> ModelCaps {
+    use LangCoverage::{All, English, Set};
     match (provider, model) {
-        ("groq", _) => ModelCaps {
-            live: false,
-            batch: true,
-            lang: if model == "distil-whisper-large-v3-en" {
-                LangSupport::EnglishOnly
-            } else {
-                LangSupport::All
-            },
-        },
-        ("fireworks", "fireworks-asr-large") => ModelCaps {
-            live: true,
-            batch: true,
-            lang: LangSupport::All,
-        },
-        ("fireworks", _) => ModelCaps {
-            live: false,
-            batch: true,
-            lang: LangSupport::All,
-        },
-        _ => ModelCaps {
-            live: true,
-            batch: true,
-            lang: LangSupport::All,
-        },
+        // u3-rt-pro streams 6 European langs; batch (Universal-2) detects all 99 with expected_languages.
+        ("assemblyai", _) => ModelCaps { live: Some(Set(AAI_EUR6)), batch: Some(All), rank: 0 },
+        // nova-* stream/batch via language=multi (10 langs); ro reachable only as a forced single language.
+        ("deepgram", "nova-3") | ("deepgram", "nova-2") | ("deepgram", "nova-2-general") => {
+            ModelCaps { live: Some(Set(DG_MULTI10)), batch: Some(Set(DG_MULTI10)), rank: 10 }
+        }
+        // Deepgram-hosted Whisper: batch only.
+        ("deepgram", _) => ModelCaps { live: None, batch: Some(Set(DG_MULTI10)), rank: 40 },
+        // Fireworks streaming ASR: live + batch, full 99-language auto-detect.
+        ("fireworks", "fireworks-asr-large") => ModelCaps { live: Some(All), batch: Some(All), rank: 15 },
+        ("fireworks", _) => ModelCaps { live: None, batch: Some(All), rank: 30 },
+        // Groq Whisper: batch only; distil is English-only.
+        ("groq", "distil-whisper-large-v3-en") => ModelCaps { live: None, batch: Some(English), rank: 50 },
+        ("groq", _) => ModelCaps { live: None, batch: Some(All), rank: 25 },
+        _ => ModelCaps { live: Some(All), batch: Some(All), rank: 100 },
     }
 }
 
-/// Find best compatible model given mode/lang constraints. Returns None if current model is fine.
-pub fn resolve_model(current: &str, mode: &str, lang: &str) -> Option<String> {
-    let (provider, model) = parse_provider_model(current);
-
-    let needs_live = mode == "live";
-    let needs_multilang = lang != "en" && lang != "auto";
-
-    let compatible = |p: &str, m: &str| -> bool {
-        let c = model_caps(p, m);
-        (!needs_live || c.live) && (!needs_multilang || c.lang != LangSupport::EnglishOnly)
+/// Smart fallback: if `current` can't satisfy the mode + required languages, return the
+/// best compatible model id — preferring the same provider, then overall rank. None means
+/// the current pick is fine. `required` is the preferred-language set (for auto) or the
+/// single chosen language.
+pub fn resolve_model(current: &str, mode: &str, required: &[&str]) -> Option<String> {
+    let compatible = |id: &str| {
+        let (p, m) = parse_provider_model(id);
+        model_caps(p, m).coverage(mode).is_some_and(|c| c.covers(required))
     };
-
-    if compatible(provider, model) {
+    if compatible(current) {
         return None;
     }
-
-    // same provider first
-    for m in provider_models(provider) {
-        if compatible(provider, m) {
-            return Some(format!("{provider}/{m}"));
-        }
-    }
-
-    Some("deepgram/nova-3".to_string())
+    let cur_provider = parse_provider_model(current).0;
+    ALL_MODELS
+        .iter()
+        .filter(|id| compatible(id))
+        .min_by_key(|id| {
+            let (p, m) = parse_provider_model(id);
+            (u32::from(p != cur_provider), model_caps(p, m).rank)
+        })
+        .map(|s| s.to_string())
 }
 
 pub const LANGUAGES: &[(&str, &str)] = &[
@@ -111,6 +132,7 @@ pub fn lang_name(code: &str) -> Option<&'static str> {
 
 pub fn provider_models(provider: &str) -> &'static [&'static str] {
     match provider {
+        "assemblyai" => &["universal"],
         "deepgram" => &["nova-3", "nova-2", "nova-2-general", "whisper-large", "whisper-medium", "whisper-small", "whisper-tiny"],
         "groq" => &["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"],
         "fireworks" => &["fireworks-asr-large", "whisper-v3-turbo", "whisper-v3"],
@@ -119,6 +141,7 @@ pub fn provider_models(provider: &str) -> &'static [&'static str] {
 }
 
 pub const ALL_MODELS: &[&str] = &[
+    "assemblyai/universal",
     "deepgram/nova-3", "deepgram/nova-2", "deepgram/nova-2-general",
     "deepgram/whisper-large", "deepgram/whisper-medium", "deepgram/whisper-small", "deepgram/whisper-tiny",
     "groq/whisper-large-v3-turbo", "groq/whisper-large-v3", "groq/distil-whisper-large-v3-en",
@@ -190,6 +213,7 @@ pub fn http_client() -> &'static reqwest::Client {
 
 pub fn get_api_key(provider: &str) -> Result<String> {
     let env_var = match provider {
+        "assemblyai" => "ASSEMBLYAI_API_KEY",
         "deepgram" => "DEEPGRAM_API_KEY",
         "groq" => "GROQ_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
@@ -197,6 +221,27 @@ pub fn get_api_key(provider: &str) -> Result<String> {
     };
 
     std::env::var(env_var).context(format!("{env_var} not set"))
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayMode {
+    /// No overlay.
+    Off,
+    /// Pill/status animation only (recording waveform, processing) — no text panel.
+    Status,
+    /// Pill that expands into the live transcript panel.
+    Full,
+}
+
+impl OverlayMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            OverlayMode::Off => "off",
+            OverlayMode::Status => "status",
+            OverlayMode::Full => "full",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -219,15 +264,41 @@ pub struct State {
     pub font: String,
     #[serde(default)]
     pub input: String,
+    #[serde(default = "default_languages")]
+    pub languages: Vec<String>,
+    /// Overlay mode override; None follows the output mode (see `overlay_mode`).
+    #[serde(default)]
+    pub overlay: Option<OverlayMode>,
+    /// Custom vocabulary / keyterms — biases recognition toward these names/jargon. Passed as
+    /// keyterms_prompt (AssemblyAI) / keyterm (Deepgram Nova-3) / keywords (Nova-2) / prompt
+    /// (Groq, Fireworks — soft hint only). Fixes acoustic mis-recognition the LLM pass can't.
+    #[serde(default)]
+    pub vocabulary: Vec<String>,
+    /// Remove filler words (um/uh) at the provider level — useful when the LLM pass is off.
+    /// Maps to AssemblyAI `disfluencies=false` / Deepgram `filler_words=false`.
+    #[serde(default = "default_true")]
+    pub remove_fillers: bool,
+    /// When typing (output = type) into an app without Wayland input-method support (kitty/TUIs,
+    /// XWayland), synthesize a paste (Ctrl+Shift+V) instead of leaving it clipboard-only. Either
+    /// way a toast fires. Off = copy + toast, paste manually.
+    #[serde(default = "default_true")]
+    pub auto_paste: bool,
 }
 
 fn default_lang() -> String { std::env::var("DICTATE_LANG").unwrap_or_else(|_| AUTO_LANG.to_string()) }
-fn default_model() -> String { std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "deepgram/nova-3".to_string()) }
+fn default_model() -> String { std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "assemblyai/universal".to_string()) }
 fn default_mode() -> String { "live".to_string() }
 fn default_output() -> String { "type".to_string() }
 fn default_true() -> bool { true }
 fn default_correct_hold_ms() -> u64 { 3000 }
 fn default_font() -> String { std::env::var("DICTATE_FONT").unwrap_or_else(|_| "Inter".to_string()) }
+fn default_languages() -> Vec<String> {
+    std::env::var("DICTATE_LANGUAGES")
+        .ok()
+        .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect::<Vec<String>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["en".to_string(), "fr".to_string(), "ro".to_string()])
+}
 
 impl State {
     pub fn load(config: &Config) -> Self {
@@ -245,5 +316,16 @@ impl State {
         if let Ok(s) = toml::to_string_pretty(self) {
             let _ = fs::write(&config.config_file, s);
         }
+    }
+
+    /// Whether the overlay panel should be shown: an explicit override if set, otherwise
+    /// the mode default — off for direct typing (text lands in the focused app), on for
+    /// clipboard (where the panel is the only view of the transcript).
+    /// Resolved overlay mode: explicit override, else the output-mode default — a
+    /// status-only pill for direct typing (text lands in the focused app, so no panel),
+    /// the full text panel for clipboard (where the panel is the only view).
+    pub fn overlay_mode(&self) -> OverlayMode {
+        self.overlay
+            .unwrap_or(if self.output == "type" { OverlayMode::Status } else { OverlayMode::Full })
     }
 }
