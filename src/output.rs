@@ -126,21 +126,31 @@ pub fn append_history_record(path: &std::path::Path, record: &HistoryRecord) {
 }
 
 pub fn copy_to_clipboard(text: &str) {
-    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+    // (text, done) — the worker copies, then signals `done` so callers can wait for the selection
+    // to actually be set. The copy runs on a dedicated thread so its fork() (wl-clipboard serves
+    // the selection from a forked child) stays off tokio's worker threads.
+    type Job = (String, std::sync::mpsc::Sender<()>);
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<Job>> = std::sync::OnceLock::new();
     let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("clipboard".into())
             .spawn(move || {
-                while let Ok(text) = rx.recv() {
+                while let Ok((text, done)) = rx.recv() {
                     let opts = Options::new();
                     if let Err(e) = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text) {
                         tracing::error!("clipboard copy failed: {e}");
                     }
+                    let _ = done.send(());
                 }
             })
             .expect("clipboard thread");
         tx
     });
-    let _ = tx.send(text.to_string());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if tx.send((text.to_string(), done_tx)).is_ok() {
+        // Block until the selection is actually set. Without this, the paste chord fires before the
+        // async copy lands and pastes the PREVIOUS transcript (or nothing) — the clipboard race.
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    }
 }
