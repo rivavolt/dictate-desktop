@@ -6,10 +6,12 @@
 //! (as wrtype did) races that reset against the key event and Ctrl+Shift sometimes drops, leaking a
 //! bare "v". With a fixed keymap the modifier keys we hold are exactly what's live when "v" lands.
 //!
-//! We also press the *standard* evdev keycodes (Ctrl=29, Shift=42, V=47, Enter=28). Those read
-//! identically on the user's real (AZERTY) seat keymap — unlike wrtype's sequentially-allocated
-//! codes, which on AZERTY collided with `twosuperior` and toggled the ² dropdown. So this fixes both
-//! the dropped modifier and the stray-keybind problems at once, on any wlroots compositor.
+//! Modifiers go through the explicit `modifiers()` request (set to Ctrl+Shift, then cleared to 0),
+//! not by pressing modifier keys: wlroots doesn't reliably derive modifier state from a virtual
+//! keyboard's modifier-key presses, and a press whose release is missed would leave a modifier
+//! stuck. The keys we do press (V, Enter) use the *standard* evdev keycodes, which read identically
+//! on the user's real (AZERTY) seat keymap — unlike wrtype's sequentially-allocated codes, which on
+//! AZERTY collided with `twosuperior` and toggled the ² dropdown.
 
 use anyhow::Result;
 use std::io::Write;
@@ -25,10 +27,12 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 // Linux evdev keycodes — what zwp_virtual_keyboard.key expects (the compositor adds 8 for XKB).
-const EV_LEFTCTRL: u32 = 29;
-const EV_LEFTSHIFT: u32 = 42;
 const EV_V: u32 = 47;
 const EV_ENTER: u32 = 28;
+
+// Depressed-modifier mask for our keymap's real modifiers: Shift = bit 0 (1), Control = bit 2 (4).
+const MOD_SHIFT: u32 = 1;
+const MOD_CTRL: u32 = 4;
 
 // Self-contained keymap: defines exactly the keys we press at their standard XKB keycodes (evdev+8),
 // with a modifier_map so holding Control_L/Shift_L sets the real modifiers. Types and compat come
@@ -113,21 +117,21 @@ impl KeyInject {
         self.keyboard.key(self.time, evdev, state.into());
     }
 
-    /// Ctrl+Shift+V. The fixed keymap means the modifiers we hold are still live when V lands, so it
-    /// pastes the clipboard instead of leaking a bare "v".
+    /// Ctrl+Shift+V. Modifiers are set with the explicit `modifiers()` request and cleared right
+    /// after — no modifier key is held, so none can stick — and because the keymap never re-uploads,
+    /// the modifiers are still live when V lands, so it pastes the clipboard instead of a bare "v".
     pub fn paste(&mut self) {
-        self.key(EV_LEFTCTRL, true);
-        self.key(EV_LEFTSHIFT, true);
+        self.keyboard.modifiers(MOD_CTRL | MOD_SHIFT, 0, 0, 0);
+        let _ = self.conn.roundtrip();
         self.key(EV_V, true);
         self.key(EV_V, false);
-        self.key(EV_LEFTSHIFT, false);
-        self.key(EV_LEFTCTRL, false);
-        let _ = self.conn.flush();
+        self.keyboard.modifiers(0, 0, 0, 0);
+        let _ = self.conn.roundtrip();
     }
 
     pub fn enter(&mut self) {
         self.key(EV_ENTER, true);
         self.key(EV_ENTER, false);
-        let _ = self.conn.flush();
+        let _ = self.conn.roundtrip();
     }
 }
