@@ -45,6 +45,7 @@ const CIRCLE_GAP: f32 = 12.0;          // gap between status circles
 const RECORD_PULSE_MS: f32 = 1400.0;   // recording circle pulse period
 const SPINNER_MS: f32 = 1100.0;        // processing spinner rotation period
 const INDICATOR_FADE_MS: f32 = 180.0;  // circle fade-in / done fade-out
+const DONE_HOLD_S: f32 = 0.45;         // hold the done flash + checkmark before fading out
 
 #[derive(Clone, Copy, PartialEq)]
 enum IndicatorKind {
@@ -380,6 +381,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
                         ind.kind = IndicatorKind::Done;
                         ind.phase = 0.0;
+                        ind.eta_remaining = DONE_HOLD_S; // hold the flash + checkmark before fading
                     }
                     // Full mode: hold the finished transcript briefly, then let it fade (a paste
                     // toast that follows will override this with its own message + timer).
@@ -558,7 +560,14 @@ impl State {
         self.indicators.retain_mut(|ind| {
             ind.phase += std::f32::consts::TAU * dt / 1000.0;
             match ind.kind {
-                IndicatorKind::Done => ind.fade = (ind.fade - dt / INDICATOR_FADE_MS).max(0.0),
+                // Hold the done circle (flash + checkmark) for DONE_HOLD_S, then fade it out.
+                IndicatorKind::Done => {
+                    if ind.eta_remaining > 0.0 {
+                        ind.eta_remaining = (ind.eta_remaining - dt / 1000.0).max(0.0);
+                    } else {
+                        ind.fade = (ind.fade - dt / INDICATOR_FADE_MS).max(0.0);
+                    }
+                }
                 _ => ind.fade = (ind.fade + dt / INDICATOR_FADE_MS).min(1.0),
             }
             if let IndicatorKind::Processing = ind.kind {
@@ -826,12 +835,20 @@ impl State {
                     }
                 }
                 IndicatorKind::Done => {
+                    // Green flash at completion, decaying over ~0.18s (phase resets to 0 on Done
+                    // and advances in radians, so TAU*0.18 is roughly one flash's worth).
+                    let flash = (1.0 - ind.phase / (std::f32::consts::TAU * 0.18)).clamp(0.0, 1.0);
+                    if flash > 0.0 {
+                        let mut fl = Path::new();
+                        fl.circle(cx, cy, radius);
+                        self.canvas.fill_path(&fl, &Paint::color(Color::rgbaf(0.3, 0.8, 0.42, 0.55 * flash * a)));
+                    }
                     let cs = icon_area * 0.28;
                     let mut check = Path::new();
                     check.move_to(cx - cs, cy);
                     check.line_to(cx - cs * 0.25, cy + cs * 0.7);
                     check.line_to(cx + cs, cy - cs * 0.6);
-                    let mut paint = Paint::color(Color::rgbaf(0.4, 0.85, 0.45, a));
+                    let mut paint = Paint::color(Color::rgbaf(0.5, 0.92, 0.55, a));
                     paint.set_line_width(3.0 * sf);
                     self.canvas.stroke_path(&check, &paint);
                 }

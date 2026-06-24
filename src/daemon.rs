@@ -167,20 +167,18 @@ async fn finalize_transcript(
     } else {
         transcript
     };
-    let mut pasted = false;
     if !final_text.is_empty() {
         overlay.set_text(final_text.clone());
         output::copy_to_clipboard(&final_text);
         if !is_clipboard && !already_typed {
-            // Input method commits the whole string if a field is focused; otherwise it's
-            // already on the clipboard, so paste it (or just toast if auto-paste is off).
+            // Input method commits the whole string if a field is focused; otherwise it's already
+            // on the clipboard, so paste it. Either way the circle resolves via done(seq) below.
             let n = final_text.chars().count();
             if output::type_text(&final_text) {
                 tracing::info!("delivered via input-method ({n} chars)");
             } else {
                 tracing::info!("input-method inactive → paste fallback (auto_paste={auto_paste}, {n} chars)");
                 output::paste(auto_paste);
-                pasted = true;
             }
         }
         let _ = std::fs::write(transcript_file, &final_text);
@@ -216,15 +214,9 @@ async fn finalize_transcript(
         let hold = (800 + words * 100).min(correct_hold_ms);
         tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
     }
-    // Resolve this utterance's status circle regardless of delivery path.
+    // Resolve this utterance's status circle regardless of delivery path. The "done" signal lives
+    // in the circle itself (a flash + checkmark) — no text-panel toast, which would cover the row.
     overlay.done(seq);
-    if pasted {
-        overlay.toast(format!(
-            "{} · {} chars",
-            if auto_paste { "pasted" } else { "copied — paste manually" },
-            final_text.chars().count()
-        ));
-    }
 }
 
 struct DaemonState {
