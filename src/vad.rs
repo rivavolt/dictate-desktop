@@ -42,6 +42,7 @@ pub async fn stream_vad(
     provider: &str,
     state: &config::State,
     overlay: overlay::Handle,
+    seq: u64,
     transcript_file: PathBuf,
     chunk_file: PathBuf,
 ) -> Result<String> {
@@ -123,6 +124,7 @@ pub async fn stream_vad(
                                 &state.vocabulary,
                                 state.remove_fillers,
                                 &overlay,
+                                seq,
                                 &state.output,
                                 &transcript_file,
                                 &mut full_transcript,
@@ -154,6 +156,7 @@ pub async fn stream_vad(
             &state.vocabulary,
             state.remove_fillers,
             &overlay,
+            seq,
             &state.output,
             &transcript_file,
             &mut full_transcript,
@@ -175,6 +178,7 @@ async fn transcribe_chunk(
     vocabulary: &[String],
     remove_fillers: bool,
     overlay: &overlay::Handle,
+    seq: u64,
     _output_mode: &str,
     transcript_file: &PathBuf,
     full_transcript: &mut String,
@@ -185,7 +189,7 @@ async fn transcribe_chunk(
         return;
     }
 
-    overlay.processing(0.0);
+    overlay.processing(seq, 0.0);
 
     match daemon::transcribe_with_retry(chunk_file, provider, lang, languages, model, vocabulary, remove_fillers).await {
         Ok(transcript) if !transcript.is_empty() => {

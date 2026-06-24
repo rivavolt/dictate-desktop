@@ -123,6 +123,7 @@ async fn finalize_transcript(
     already_typed: bool,
     auto_paste: bool,
     overlay: &overlay::Handle,
+    seq: u64,
     transcript_file: &std::path::Path,
     history_file: &std::path::Path,
     audio_dir: &std::path::Path,
@@ -215,14 +216,14 @@ async fn finalize_transcript(
         let hold = (800 + words * 100).min(correct_hold_ms);
         tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
     }
+    // Resolve this utterance's status circle regardless of delivery path.
+    overlay.done(seq);
     if pasted {
         overlay.toast(format!(
             "{} · {} chars",
             if auto_paste { "pasted" } else { "copied — paste manually" },
             final_text.chars().count()
         ));
-    } else {
-        overlay.copied();
     }
 }
 
@@ -288,12 +289,13 @@ impl DaemonState {
         }
 
         self.recording = true;
+        let seq = REC_SEQ.fetch_add(1, Ordering::Relaxed);
         fs::write(&self.config.state_file, "recording")?;
         sound::play_start();
         let overlay_mode = self.state.overlay_mode();
         if overlay_mode != config::OverlayMode::Off {
             self.overlay.set_status_only(overlay_mode == config::OverlayMode::Status);
-            self.overlay.show();
+            self.overlay.start(seq);
             self.overlay.set_info(self.state.mode.clone(), self.state.lang.clone());
         }
 
@@ -320,10 +322,10 @@ impl DaemonState {
         );
 
         let result = match self.state.mode.as_str() {
-            "live" => self.start_live(stop, &provider),
-            "batch" => self.start_batch(stop, &provider),
-            "vad" => self.start_vad(stop, &provider),
-            _ => self.start_live(stop, &provider),
+            "live" => self.start_live(stop, &provider, seq),
+            "batch" => self.start_batch(stop, &provider, seq),
+            "vad" => self.start_vad(stop, &provider, seq),
+            _ => self.start_live(stop, &provider, seq),
         };
         self.state.model = picked; // restore explicit pick — the fallback is per-session
         result?;
@@ -331,7 +333,7 @@ impl DaemonState {
         Ok(format!("recording ({}, {})", self.state.mode, provider))
     }
 
-    fn start_live(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
+    fn start_live(&mut self, stop: Arc<AtomicBool>, provider: &str, seq: u64) -> Result<()> {
         let audio_level = self.overlay.audio_level().clone();
         let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level, &self.state.input)?;
         self._audio_stream = Some(stream);
@@ -393,7 +395,7 @@ impl DaemonState {
                     last_accumulated, do_correct, correct_hold_ms, &lang,
                     &mode, &model, 0,
                     enter_after, is_clipboard, ime_used, auto_paste,
-                    &overlay_handle, &transcript_file, &history_file,
+                    &overlay_handle, seq, &transcript_file, &history_file,
                     &audio_dir, Some((&samples, sample_rate)),
                 ).await;
             });
@@ -418,10 +420,9 @@ impl DaemonState {
         Ok(())
     }
 
-    fn start_batch(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
-        // Per-session temp file: a shared path lets a fast re-trigger truncate the file
-        // while the previous transcription is still reading it (the `No such file` races).
-        let seq = REC_SEQ.fetch_add(1, Ordering::Relaxed);
+    fn start_batch(&mut self, stop: Arc<AtomicBool>, provider: &str, seq: u64) -> Result<()> {
+        // Per-utterance temp file (keyed by seq): a unique path lets a fast re-trigger record into
+        // its own file while the previous transcription is still reading the old one.
         let audio_file = self.config.audio_file.with_extension(format!("{seq}.wav"));
         let state = self.state.clone();
         let enter_after = self.state.enter;
@@ -448,7 +449,7 @@ impl DaemonState {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
 
-            overlay_handle.processing(0.0);
+            overlay_handle.processing(seq, 0.0);
 
             if let Err(e) = record.await {
                 tracing::error!("batch record error: {e}");
@@ -476,7 +477,7 @@ impl DaemonState {
             tracing::info!("batch capture: {dur_ms}ms, peak {peak}, provider {provider}");
             if samples_for_archive.is_empty() || peak < SILENCE_PEAK {
                 tracing::info!("no speech detected (peak {peak} < {SILENCE_PEAK}) — skipping");
-                overlay_handle.copied();
+                overlay_handle.done(seq);
                 let _ = fs::remove_file(&audio_file);
                 return;
             }
@@ -484,7 +485,7 @@ impl DaemonState {
             // Countdown the estimated wait (rolling per-provider latency vs this clip's length).
             let jsonl = history_file.with_file_name("history.jsonl");
             let eta = estimate_eta(&jsonl, &provider, dur_ms).unwrap_or(0.0);
-            overlay_handle.processing(eta);
+            overlay_handle.processing(seq, eta);
 
             let (_, model) = config::parse_provider_model(&state.model);
             let t0 = std::time::Instant::now();
@@ -502,7 +503,7 @@ impl DaemonState {
                 transcript, do_correct, correct_hold_ms, &lang,
                 &state.mode, &state.model, latency_ms,
                 enter_after, is_clipboard, false, state.auto_paste,
-                &overlay_handle, &transcript_file, &history_file,
+                &overlay_handle, seq, &transcript_file, &history_file,
                 &audio_dir, Some((&samples_for_archive, archive_rate)),
             ).await;
             let _ = fs::remove_file(&audio_file);
@@ -511,7 +512,7 @@ impl DaemonState {
         Ok(())
     }
 
-    fn start_vad(&mut self, stop: Arc<AtomicBool>, provider: &str) -> Result<()> {
+    fn start_vad(&mut self, stop: Arc<AtomicBool>, provider: &str, seq: u64) -> Result<()> {
         let audio_level = self.overlay.audio_level().clone();
         let (stream, audio_rx, sample_rate, samples_buf) = audio::capture_to_channel(stop.clone(), audio_level, &self.state.input)?;
         self._audio_stream = Some(stream);
@@ -532,7 +533,7 @@ impl DaemonState {
         self.record_handle = Some(tokio::spawn(async move {
             let full_transcript = match crate::vad::stream_vad(
                 audio_rx, stop, sample_rate,
-                &provider, &state, overlay_handle.clone(),
+                &provider, &state, overlay_handle.clone(), seq,
                 transcript_file.clone(), chunk_file,
             ).await {
                 Ok(t) => t,
@@ -546,7 +547,7 @@ impl DaemonState {
                 full_transcript, do_correct, correct_hold_ms, &lang,
                 &state.mode, &state.model, 0,
                 enter_after, is_clipboard, false, state.auto_paste,
-                &overlay_handle, &transcript_file, &history_file,
+                &overlay_handle, seq, &transcript_file, &history_file,
                 &audio_dir, Some((&samples, sample_rate)),
             ).await;
         }));

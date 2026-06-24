@@ -41,21 +41,45 @@ const SHADOW_PAD_BOT: u32 = 8;
 const PILL_ICON_PAD: f32 = 0.30; // fraction of pill height reserved as padding on each side
 const CHUNK_TAU: f32 = 80.0;
 const FINALIZE_TAU: f32 = 60.0;
+const CIRCLE_GAP: f32 = 12.0;          // gap between status circles
+const RECORD_PULSE_MS: f32 = 1400.0;   // recording circle pulse period
+const SPINNER_MS: f32 = 1100.0;        // processing spinner rotation period
+const INDICATOR_FADE_MS: f32 = 180.0;  // circle fade-in / done fade-out
+
+#[derive(Clone, Copy, PartialEq)]
+enum IndicatorKind {
+    Recording,
+    Processing,
+    Done,
+}
+
+/// One in-flight utterance's status circle. `phase` drives the pulse/spin, `fade` is 0→1 on
+/// appearance and 1→0 once `Done` so the circle animates out before being dropped.
+#[derive(Clone)]
+struct Indicator {
+    id: u64,
+    kind: IndicatorKind,
+    phase: f32,
+    eta_remaining: f32,
+    fade: f32,
+}
 
 pub enum Command {
-    Show,
+    /// Begin a recording indicator for utterance `id`.
+    Start(u64),
+    /// Utterance `id` is now awaiting its transcript; the f32 is the estimated seconds until it
+    /// lands (0 = unknown → plain spinner, no countdown).
+    Processing(u64, f32),
+    /// Utterance `id` finished — its indicator does a brief "done" pop, then fades out and clears.
+    Done(u64),
     SetText(String),
     SetPending(String),
-    /// Enter the processing state; the f32 is the estimated seconds until the transcript
-    /// lands (0 = unknown → plain pulsing dot, no countdown).
-    Processing(f32),
-    Copied,
     /// Briefly show a one-line message (paste/copy feedback) for ~2.5s, regardless of mode.
     Toast(String),
     Correcting,
     SetInfo(String, String),
     SetFont(String),
-    /// Status-only: show the pill/animations but never expand into the text panel.
+    /// Status-only: show the indicators/animations but never expand into the text panel.
     SetStatusOnly(bool),
 }
 
@@ -66,8 +90,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn show(&self) {
-        let _ = self.tx.send(Command::Show);
+    pub fn start(&self, id: u64) {
+        let _ = self.tx.send(Command::Start(id));
     }
 
     pub fn set_text(&self, text: String) {
@@ -78,12 +102,12 @@ impl Handle {
         let _ = self.tx.send(Command::SetPending(text));
     }
 
-    pub fn processing(&self, eta_secs: f32) {
-        let _ = self.tx.send(Command::Processing(eta_secs));
+    pub fn processing(&self, id: u64, eta_secs: f32) {
+        let _ = self.tx.send(Command::Processing(id, eta_secs));
     }
 
-    pub fn copied(&self) {
-        let _ = self.tx.send(Command::Copied);
+    pub fn done(&self, id: u64) {
+        let _ = self.tx.send(Command::Done(id));
     }
 
     pub fn toast(&self, msg: String) {
@@ -234,14 +258,11 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
         lang: String::new(),
         wrapped_lines: Vec::new(),
         wrapped_dirty: true,
-        listening: false,
-        processing: false,
+        indicators: Vec::new(),
         correcting: false,
         status_only: false,
         shrink_t: 0.0,
         shrink_target: 0.0,
-        pill_countdown: 0.0,
-        eta_remaining: 0.0,
         toast_remaining: 0.0,
         content_pw: 0.0,
         render_w: 0.0,
@@ -288,15 +309,11 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
     loop_handle.insert_source(cmd_rx, |event, _, state| {
         if let calloop::channel::Event::Msg(cmd) = event {
             match cmd {
-                Command::Show => {
+                Command::Start(id) => {
                     state.visible = true;
-                    state.listening = true;
-                    state.processing = false;
+                    state.fade_target = 1.0;
                     state.correcting = false;
-                    state.shrink_t = 1.0;
-                    state.shrink_target = 1.0;
-                    state.pill_countdown = 0.0;
-                    state.eta_remaining = 0.0;
+                    state.toast_remaining = 0.0;
                     state.text.clear();
                     state.pending.clear();
                     state.wrapped_dirty = true;
@@ -304,27 +321,23 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     state.chunk_fade = 1.0;
                     state.color_split = 0;
                     state.finalize_fade = 1.0;
-                    state.fade_alpha = 0.0;
-                    state.fade_target = 1.0;
-                    let pill_w = PILL_SIZE as f32 * state.scale as f32;
-                    state.content_pw = pill_w;
-                    state.render_w = pill_w * 0.7;
-                    let init_h = (PILL_SIZE + SHADOW_PAD + SHADOW_PAD_BOT) as f32;
-                    state.height = init_h;
-                    state.target_height = init_h;
-                    state.committed_layer_h = init_h as u32;
-                    state.layer.set_size(0, init_h as u32);
+                    state.shrink_t = 0.0;
+                    state.shrink_target = 0.0;
+                    if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
+                        ind.kind = IndicatorKind::Recording;
+                        ind.eta_remaining = 0.0;
+                    } else {
+                        state.indicators.push(Indicator {
+                            id, kind: IndicatorKind::Recording, phase: 0.0, eta_remaining: 0.0, fade: 0.0,
+                        });
+                    }
                     state.last_tick = std::time::Instant::now();
                     state.resize_and_redraw();
                 }
                 Command::SetText(text) => {
-                    // Status-only keeps the pill — ignore transcript text entirely.
+                    // Status-only shows only the circles — ignore transcript text entirely.
                     if !state.status_only {
-                        if state.listening || state.processing {
-                            state.shrink_target = 0.0;
-                        }
-                        state.listening = false;
-                        state.processing = false;
+                        state.shrink_target = 0.0;
                         if state.correcting && state.text != text {
                             // Corrected text arrived — crossfade from 0
                             state.correct_fade = 0.0;
@@ -341,11 +354,7 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                 }
                 Command::SetPending(text) => {
                     if !state.status_only {
-                        if state.listening || state.processing {
-                            state.shrink_target = 0.0;
-                        }
-                        state.listening = false;
-                        state.processing = false;
+                        state.shrink_target = 0.0;
                         state.pending = text;
                         state.wrapped_dirty = true;
                         state.update_reveal();
@@ -354,36 +363,38 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                         }
                     }
                 }
-                Command::Processing(eta) => {
-                    state.listening = false;
-                    state.processing = true;
-                    state.eta_remaining = eta;
-                    state.shrink_target = 1.0;
+                Command::Processing(id, eta) => {
+                    if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
+                        ind.kind = IndicatorKind::Processing;
+                        ind.eta_remaining = eta;
+                    } else {
+                        state.indicators.push(Indicator {
+                            id, kind: IndicatorKind::Processing, phase: 0.0, eta_remaining: eta, fade: 0.0,
+                        });
+                    }
+                    state.visible = true;
+                    state.fade_target = 1.0;
                     state.resize_and_redraw();
                 }
-                Command::Copied => {
-                    state.listening = false;
-                    state.processing = false;
-                    state.correcting = false;
-                    if state.text.is_empty() {
-                        state.fade_target = 0.0;
-                    } else {
-                        // Hold: 1.5s base + up to 2s for longer text
-                        let len_s = (state.text.len() as f32 / 80.0).min(4.0) * 0.5;
-                        state.pill_countdown = 1.5 + len_s;
-                        state.resize_and_redraw();
+                Command::Done(id) => {
+                    if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
+                        ind.kind = IndicatorKind::Done;
+                        ind.phase = 0.0;
                     }
+                    // Full mode: hold the finished transcript briefly, then let it fade (a paste
+                    // toast that follows will override this with its own message + timer).
+                    if !state.status_only && !state.text.is_empty() && state.toast_remaining <= 0.0 {
+                        let len_s = (state.text.len() as f32 / 80.0).min(4.0) * 0.5;
+                        state.toast_remaining = 1.5 + len_s;
+                    }
+                    state.resize_and_redraw();
                 }
                 Command::Toast(msg) => {
                     // Show a brief one-line message in the text panel even in status-only mode
                     // (paste/copy feedback). Auto-dismisses via toast_remaining in the tick.
                     state.visible = true;
                     state.fade_target = 1.0;
-                    state.listening = false;
-                    state.processing = false;
                     state.correcting = false;
-                    state.pill_countdown = 0.0;
-                    state.eta_remaining = 0.0;
                     state.shrink_target = 0.0;
                     state.text = msg;
                     state.pending.clear();
@@ -452,14 +463,11 @@ struct State {
     lang: String,
     wrapped_lines: Vec<String>,
     wrapped_dirty: bool,
-    listening: bool,
-    processing: bool,
+    indicators: Vec<Indicator>,
     correcting: bool,
     status_only: bool,
     shrink_t: f32,
     shrink_target: f32,
-    pill_countdown: f32,
-    eta_remaining: f32,
     toast_remaining: f32,
     content_pw: f32,
     render_w: f32,
@@ -508,11 +516,9 @@ impl State {
         self.visible && (
             (self.fade_alpha - self.fade_target).abs() > 0.01
             || (self.shrink_t - self.shrink_target).abs() > 0.01
-            || self.pill_countdown > 0.0
             || (self.render_w - self.content_pw).abs() > 1.0
             || (self.height - self.target_height).abs() > 0.5
-            || self.listening
-            || self.processing
+            || !self.indicators.is_empty()
             || self.correcting
             || self.correct_fade < 0.99
             || self.chunk_fade < 0.99
@@ -547,22 +553,29 @@ impl State {
         } else {
             self.shrink_t = self.shrink_target;
         }
-        // Trigger pill hold when shrink-to-pill completes
-        if self.shrink_t >= 1.0 && self.pill_countdown <= 0.0
-            && !self.listening && !self.processing && self.fade_target > 0.0
-        {
-            self.pill_countdown = 1.2;
+        // Per-indicator animation: advance pulse/spin phase, count down ETA, fade in, and fade out
+        // + drop finished (Done) circles.
+        self.indicators.retain_mut(|ind| {
+            ind.phase += std::f32::consts::TAU * dt / 1000.0;
+            match ind.kind {
+                IndicatorKind::Done => ind.fade = (ind.fade - dt / INDICATOR_FADE_MS).max(0.0),
+                _ => ind.fade = (ind.fade + dt / INDICATOR_FADE_MS).min(1.0),
+            }
+            if let IndicatorKind::Processing = ind.kind {
+                if ind.eta_remaining > 0.0 {
+                    ind.eta_remaining = (ind.eta_remaining - dt / 1000.0).max(0.0);
+                }
+            }
+            !(ind.kind == IndicatorKind::Done && ind.fade <= 0.0)
+        });
+        if !self.indicators.is_empty() {
             needs_redraw = true;
         }
-
-        // "Copied" pill hold → fade
-        if self.pill_countdown > 0.0 {
-            self.pill_countdown -= dt / 1000.0;
-            if self.pill_countdown <= 0.0 {
-                self.pill_countdown = 0.0;
-                self.fade_target = 0.0;
-            }
-            needs_redraw = true;
+        // Nothing in flight and no text/toast/correction to show → fade the overlay out.
+        if self.indicators.is_empty() && self.toast_remaining <= 0.0
+            && self.text.is_empty() && self.pending.is_empty() && !self.correcting
+        {
+            self.fade_target = 0.0;
         }
 
         // Width animation (exponential chase)
@@ -580,20 +593,19 @@ impl State {
             needs_redraw = true;
         }
 
-        // Pulse animation for listening/processing/correcting indicator
-        if self.processing && self.eta_remaining > 0.0 {
-            self.eta_remaining = (self.eta_remaining - dt / 1000.0).max(0.0);
-        }
         if self.toast_remaining > 0.0 {
             self.toast_remaining -= dt / 1000.0;
             if self.toast_remaining <= 0.0 {
                 self.toast_remaining = 0.0;
                 self.text.clear();
+                self.pending.clear();
                 self.wrapped_dirty = true;
-                self.fade_target = 0.0;
+                // Drop back to the circle-row height; the fade-out condition above handles
+                // hiding the overlay only when nothing is in flight.
+                self.target_height = (self.compute_height() + SHADOW_PAD + SHADOW_PAD_BOT) as f32;
             }
         }
-        if self.listening || self.processing || self.correcting {
+        if self.correcting {
             self.anim_phase += std::f32::consts::TAU * dt / 1000.0;
             needs_redraw = true;
         }
@@ -666,9 +678,6 @@ impl State {
     }
 
     fn display_text(&self) -> String {
-        if self.listening || self.processing {
-            return String::new();
-        }
         let mut full = self.text.clone();
         if !self.pending.is_empty() {
             if !full.is_empty() && !full.ends_with(' ') {
@@ -761,6 +770,75 @@ impl State {
         }
     }
 
+    /// Draw the status circles — one per in-flight utterance — as a centered horizontal row.
+    fn draw_indicators(&mut self, pw: f32, ph: f32, pad: f32, sf: f32) {
+        let inds = self.indicators.clone();
+        if inds.is_empty() {
+            return;
+        }
+        let n = inds.len() as f32;
+        let gap = CIRCLE_GAP * sf;
+        let base_d = PILL_SIZE as f32 * sf;
+        let max_total = pw * 0.95;
+        let mut d = base_d;
+        if n * d + (n - 1.0) * gap > max_total {
+            d = ((max_total - (n - 1.0) * gap) / n).max(base_d * 0.4);
+        }
+        let row_w = n * d + (n - 1.0) * gap;
+        let start_x = (pw - row_w) / 2.0;
+        let cy = pad + ph / 2.0;
+        let radius = d / 2.0;
+        for (i, ind) in inds.iter().enumerate() {
+            let a = self.fade_alpha * ind.fade.clamp(0.0, 1.0);
+            if a <= 0.001 {
+                continue;
+            }
+            let cx = start_x + i as f32 * (d + gap) + radius;
+            let mut bg = Path::new();
+            bg.circle(cx, cy, radius);
+            self.canvas.fill_path(&bg, &Paint::color(Color::rgbaf(0.0, 0.0, 0.0, 0.92 * a)));
+            let mut border = Paint::color(Color::rgbaf(1.0, 1.0, 1.0, 0.12 * a));
+            border.set_line_width(sf);
+            self.canvas.stroke_path(&bg, &border);
+            let icon_area = d * (1.0 - PILL_ICON_PAD * 2.0);
+            match ind.kind {
+                IndicatorKind::Recording => {
+                    let pulse = (ind.phase * (1000.0 / RECORD_PULSE_MS)).sin() * 0.25 + 0.75;
+                    self.draw_waveform_bars(cx, cy, icon_area, Color::rgbaf(0.9, 0.27, 0.22, pulse * a));
+                }
+                IndicatorKind::Processing => {
+                    let a0 = ind.phase * (1000.0 / SPINNER_MS);
+                    let a1 = a0 + std::f32::consts::PI * 1.3;
+                    let mut arc = Path::new();
+                    arc.arc(cx, cy, radius * 0.62, a0, a1, femtovg::Solidity::Hole);
+                    let mut arc_paint = Paint::color(Color::rgbaf(0.92, 0.92, 0.92, 0.9 * a));
+                    arc_paint.set_line_width(2.5 * sf);
+                    self.canvas.stroke_path(&arc, &arc_paint);
+                    if ind.eta_remaining > 0.0 {
+                        let label = format!("{}", ind.eta_remaining.ceil() as u32);
+                        let label_size = d * 0.34;
+                        let mut paint = Paint::color(Color::rgbaf(0.92, 0.92, 0.92, a));
+                        paint.set_font(&[self.font_id]);
+                        paint.set_font_size(label_size);
+                        paint.set_text_baseline(Baseline::Middle);
+                        let tw = self.measure_text_width(&label, label_size);
+                        let _ = self.canvas.fill_text(cx - tw / 2.0, cy, &label, &paint);
+                    }
+                }
+                IndicatorKind::Done => {
+                    let cs = icon_area * 0.28;
+                    let mut check = Path::new();
+                    check.move_to(cx - cs, cy);
+                    check.line_to(cx - cs * 0.25, cy + cs * 0.7);
+                    check.line_to(cx + cs, cy - cs * 0.6);
+                    let mut paint = Paint::color(Color::rgbaf(0.4, 0.85, 0.45, a));
+                    paint.set_line_width(3.0 * sf);
+                    self.canvas.stroke_path(&check, &paint);
+                }
+            }
+        }
+    }
+
     fn rewrap_if_dirty(&mut self) {
         if !self.wrapped_dirty {
             return;
@@ -774,8 +852,15 @@ impl State {
         self.wrapped_lines = self.wrap_text(&display, max_text_w, font_sz);
     }
 
+    /// Whether the text panel (transcript / toast / correction) should be shown. Otherwise the
+    /// status circles are the display.
+    fn text_active(&self) -> bool {
+        self.toast_remaining > 0.0
+            || (!self.status_only && (!self.text.is_empty() || !self.pending.is_empty() || self.correcting))
+    }
+
     fn compute_height(&mut self) -> u32 {
-        if self.listening || self.processing {
+        if !self.text_active() {
             return PILL_SIZE;
         }
         let sf = self.scale as f32;
@@ -841,6 +926,16 @@ impl State {
             return;
         }
 
+        // Status circles (one per in-flight utterance) are the default display; the text panel is
+        // only drawn when there's a transcript / toast / correction to show.
+        if !self.text_active() {
+            self.draw_indicators(pw, ph, pad, sf);
+            self.canvas.flush();
+            self.egl_lib.swap_buffers(self.egl_display, self.egl_surface).ok();
+            self.layer.wl_surface().set_buffer_scale(s);
+            return;
+        }
+
         // Shrink animation ease
         let ease_t = if self.shrink_t > 0.0 {
             let t = self.shrink_t.min(1.0);
@@ -852,8 +947,6 @@ impl State {
         let bg_alpha = 0.92 * self.fade_alpha;
         let target_h = PILL_SIZE as f32 * sf;
 
-        // Pill shrinks to a circle for both recording and copied icons
-        let is_recording_pill = self.listening || self.shrink_target < 0.5;
         let target_w = target_h;
 
         // Background rect geometry (content area starts at y=pad)
@@ -937,57 +1030,8 @@ impl State {
         // Text opacity (includes correction crossfade)
         let text_opacity = (1.0 - ease_t * 3.0).max(0.0);
         let text_alpha = self.fade_alpha * text_opacity * self.correct_fade;
-        let pill_label_opacity = if ease_t > 0.3 { ((ease_t - 0.3) * (1.0 / 0.7)).min(1.0) } else { 0.0 };
-        let pill_alpha = self.fade_alpha * pill_label_opacity;
-
-        let show_pill = (self.listening || self.processing || self.pill_countdown > 0.0 || pill_alpha > 0.0) && ease_t > 0.3;
-
-        // Pill icons: waveform for recording, pulsing dot for processing, check for done
-        if show_pill {
-            let cx = rx + rw / 2.0;
-            let cy = ry + rh / 2.0;
-            let icon_area = rh * (1.0 - PILL_ICON_PAD * 2.0); // content area after padding
-            let pulse = (self.anim_phase.sin() * 0.5 + 0.5) * 0.4 + 0.6;
-
-            if self.processing {
-                let a = pulse * pill_alpha;
-                if self.eta_remaining > 0.0 {
-                    // ETA countdown: estimated whole seconds until the transcript lands.
-                    let label = format!("{}", self.eta_remaining.ceil() as u32);
-                    let label_size = rh * 0.4;
-                    let mut paint = Paint::color(Color::rgbaf(0.9, 0.9, 0.9, a));
-                    paint.set_font(&[self.font_id]);
-                    paint.set_font_size(label_size);
-                    paint.set_text_baseline(Baseline::Middle);
-                    let tw = self.measure_text_width(&label, label_size);
-                    let _ = self.canvas.fill_text(cx - tw / 2.0, cy, &label, &paint);
-                } else {
-                    let radius = icon_area * 0.25;
-                    let mut circle = Path::new();
-                    circle.circle(cx, cy, radius);
-                    let paint = Paint::color(Color::rgbaf(0.85, 0.85, 0.85, a));
-                    self.canvas.fill_path(&circle, &paint);
-                }
-            } else if is_recording_pill {
-                let a = pulse * pill_alpha;
-                let show_label = self.listening && !self.lang.is_empty() && self.lang != "auto";
-                let bar_cy = if show_label { cy - icon_area * 0.08 } else { cy };
-                self.draw_waveform_bars(cx, bar_cy, icon_area, Color::rgbaf(0.85, 0.25, 0.2, a));
-                if show_label {
-                    let label = self.lang.to_uppercase();
-                    let label_size = rh * 0.19;
-                    let mut paint = Paint::color(Color::rgbaf(1.0, 1.0, 1.0, pill_alpha * 0.45));
-                    paint.set_font(&[self.font_id]);
-                    paint.set_font_size(label_size);
-                    paint.set_text_baseline(Baseline::Middle);
-                    let tw = self.measure_text_width(&label, label_size);
-                    let _ = self.canvas.fill_text(cx - tw / 2.0, cy + icon_area * 0.55, &label, &paint);
-                }
-            }
-        }
-
         // Normal transcript text
-        if text_alpha > 0.01 && !show_pill {
+        if text_alpha > 0.01 {
             let font_sz = self.font_size * sf;
 
             // Position text for target width so it doesn't shift during box animation
