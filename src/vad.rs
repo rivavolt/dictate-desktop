@@ -108,6 +108,9 @@ pub async fn stream_vad(
         full
     });
 
+    let mut frame_count: u64 = 0;
+    let mut voice_total: u64 = 0;
+    tracing::info!("vad: stream started, listening");
     while let Some(chunk) = audio_rx.recv().await {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -125,6 +128,13 @@ pub async fn stream_vad(
             let vad_samples = audio::resample(&native_frame, sample_rate, VAD_RATE);
             let is_voice = vad_samples.len() >= VAD_FRAME_SAMPLES
                 && detector.predict_i16(&vad_samples[..VAD_FRAME_SAMPLES]) >= VOICE_THRESHOLD;
+            frame_count += 1;
+            if is_voice {
+                voice_total += 1;
+            }
+            if frame_count % 125 == 0 {
+                tracing::info!("vad: {voice_total}/{frame_count} voice frames (resampled {}), speech_active={speech_active}", vad_samples.len());
+            }
 
             if !speech_active {
                 if is_voice {
@@ -135,6 +145,7 @@ pub async fn stream_vad(
                         // New utterance → its own Recording bubble, like a fresh batch capture.
                         let useq = daemon::REC_SEQ.fetch_add(1, Ordering::Relaxed);
                         overlay.start(useq);
+                        tracing::info!("vad: utterance start (seq {useq})");
                         current_seq = Some(useq);
                         for pre_frame in pre_buffer.drain(..) {
                             speech_samples.extend_from_slice(&pre_frame);
@@ -164,6 +175,7 @@ pub async fn stream_vad(
                             if speech_samples.len() >= min_speech_samples {
                                 // Utterance ended: flip its bubble to processing and hand it to the
                                 // worker, then keep listening immediately (don't block).
+                                tracing::info!("vad: utterance end ({} samples), transcribing", speech_samples.len());
                                 overlay.processing(useq, 0.0);
                                 let _ = chunk_tx.send((useq, std::mem::take(&mut speech_samples)));
                             } else {
