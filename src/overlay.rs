@@ -839,15 +839,11 @@ impl State {
                     let mut arc_paint = Paint::color(Color::rgbaf(cr, cg, cb, 0.9 * a));
                     arc_paint.set_line_width(2.5 * sf);
                     self.canvas.stroke_path(&arc, &arc_paint);
-                    // Countdown number while ticking; "…" once it overruns; nothing if ETA unknown.
-                    let label = if ind.eta_remaining > 0.0 {
-                        Some(format!("{}", ind.eta_remaining.ceil() as u32))
-                    } else if ind.eta_set {
-                        Some("…".to_string())
-                    } else {
-                        None
-                    };
-                    if let Some(label) = label {
+                    // Countdown number while ticking (text); three centered dots once it overruns.
+                    // The dots are hand-drawn at `cy`, not "…" text — an ellipsis glyph sits on the
+                    // baseline, so even middle-baselined it rendered ~10px below the circle's center.
+                    if ind.eta_remaining > 0.0 {
+                        let label = format!("{}", ind.eta_remaining.ceil() as u32);
                         let label_size = d * 0.34;
                         let mut paint = Paint::color(Color::rgbaf(cr, cg, cb, a));
                         paint.set_font(&[self.font_id]);
@@ -855,6 +851,15 @@ impl State {
                         paint.set_text_baseline(Baseline::Middle);
                         let tw = self.measure_text_width(&label, label_size);
                         let _ = self.canvas.fill_text(cx - tw / 2.0, cy, &label, &paint);
+                    } else if ind.eta_set {
+                        let dot_r = d * 0.045;
+                        let gap = d * 0.16;
+                        let dot_paint = Paint::color(Color::rgbaf(cr, cg, cb, a));
+                        for k in [-1.0_f32, 0.0, 1.0] {
+                            let mut dot = Path::new();
+                            dot.circle(cx + k * gap, cy, dot_r);
+                            self.canvas.fill_path(&dot, &dot_paint);
+                        }
                     }
                 }
                 IndicatorKind::Done(kind) => {
