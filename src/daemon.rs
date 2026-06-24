@@ -1124,10 +1124,16 @@ pub async fn run() -> Result<()> {
             Some(ev) = fn_rx.recv() => {
                 match ev {
                     fnkey::KeyEvent::Start => {
-                        let _ = daemon.start_recording();
+                        // VAD is hands-free: a trigger press toggles continuous detection
+                        // on/off (release is ignored). Batch/live stay push-to-talk (hold).
+                        if daemon.state.mode == "vad" {
+                            let _ = daemon.toggle_recording();
+                        } else {
+                            let _ = daemon.start_recording();
+                        }
                     }
                     fnkey::KeyEvent::Release => {
-                        if daemon.recording {
+                        if daemon.state.mode != "vad" && daemon.recording {
                             let _ = daemon.stop_recording();
                         }
                     }
