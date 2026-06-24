@@ -9,7 +9,7 @@ use crate::audio;
 use crate::config;
 use crate::daemon;
 use crate::output;
-use crate::overlay;
+use crate::overlay::{self, DoneKind};
 
 const VAD_RATE: u32 = 16000;
 const VAD_FRAME_SAMPLES: usize = 256; // earshot requires exactly 256 samples (16ms at 16kHz)
@@ -35,6 +35,11 @@ fn encode_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
+/// Continuous voice-activity dictation: detect each utterance (speech bounded by silence) and, the
+/// moment a pause ends it, transcribe + deliver it live — one overlay bubble per utterance, exactly
+/// like batch mode but back-to-back. Detection never blocks on transcription: finished utterances
+/// are handed to a serialized worker that transcribes and types them strictly in order, so the loop
+/// keeps listening (and spawning the next bubble) while the previous utterance is still in flight.
 pub async fn stream_vad(
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
@@ -42,7 +47,7 @@ pub async fn stream_vad(
     provider: &str,
     state: &config::State,
     overlay: overlay::Handle,
-    seq: u64,
+    _seq: u64,
     transcript_file: PathBuf,
     chunk_file: PathBuf,
 ) -> Result<String> {
@@ -58,11 +63,50 @@ pub async fn stream_vad(
     let mut voice_count: usize = 0;
     let mut speech_samples: Vec<i16> = Vec::new();
     let mut pre_buffer: VecDeque<Vec<i16>> = VecDeque::new();
-    let mut full_transcript = String::new();
+    let mut current_seq: Option<u64> = None;
 
     let _ = std::fs::write(&transcript_file, "");
-    let (_, model) = config::parse_provider_model(&state.model);
-    let model = model.to_string();
+
+    // Worker: transcribe + deliver utterances strictly in order. Detection sends finished
+    // utterances here and keeps going, so the network round-trip never blocks the next bubble,
+    // while ordered delivery means typed text can't get scrambled.
+    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<(u64, Vec<i16>)>();
+    let w_overlay = overlay.clone();
+    let w_provider = provider.to_string();
+    let w_lang = state.lang.clone();
+    let w_languages = state.languages.clone();
+    let (_, w_model) = config::parse_provider_model(&state.model);
+    let w_model = w_model.to_string();
+    let w_vocab = state.vocabulary.clone();
+    let w_remove = state.remove_fillers;
+    let w_output = state.output.clone();
+    let w_auto_paste = state.auto_paste;
+    let w_chunk_file = chunk_file.clone();
+    let w_transcript_file = transcript_file.clone();
+    let worker = tokio::spawn(async move {
+        let mut full = String::new();
+        while let Some((useq, samples)) = chunk_rx.recv().await {
+            transcribe_and_deliver(
+                &samples,
+                sample_rate,
+                &w_chunk_file,
+                &w_provider,
+                &w_lang,
+                &w_languages,
+                &w_model,
+                &w_vocab,
+                w_remove,
+                &w_overlay,
+                useq,
+                &w_output,
+                w_auto_paste,
+                &w_transcript_file,
+                &mut full,
+            )
+            .await;
+        }
+        full
+    });
 
     while let Some(chunk) = audio_rx.recv().await {
         if stop.load(Ordering::Relaxed) {
@@ -88,6 +132,10 @@ pub async fn stream_vad(
                     if voice_count >= DEBOUNCE_FRAMES {
                         speech_active = true;
                         silence_count = 0;
+                        // New utterance → its own Recording bubble, like a fresh batch capture.
+                        let useq = daemon::REC_SEQ.fetch_add(1, Ordering::Relaxed);
+                        overlay.start(useq);
+                        current_seq = Some(useq);
                         for pre_frame in pre_buffer.drain(..) {
                             speech_samples.extend_from_slice(&pre_frame);
                         }
@@ -112,24 +160,15 @@ pub async fn stream_vad(
                 } else {
                     silence_count += 1;
                     if silence_count >= SILENCE_THRESHOLD {
-                        if speech_samples.len() >= min_speech_samples {
-                            transcribe_chunk(
-                                &speech_samples,
-                                sample_rate,
-                                &chunk_file,
-                                provider,
-                                &state.lang,
-                                &state.languages,
-                                &model,
-                                &state.vocabulary,
-                                state.remove_fillers,
-                                &overlay,
-                                seq,
-                                &state.output,
-                                &transcript_file,
-                                &mut full_transcript,
-                            )
-                            .await;
+                        if let Some(useq) = current_seq.take() {
+                            if speech_samples.len() >= min_speech_samples {
+                                // Utterance ended: flip its bubble to processing and hand it to the
+                                // worker, then keep listening immediately (don't block).
+                                overlay.processing(useq, 0.0);
+                                let _ = chunk_tx.send((useq, std::mem::take(&mut speech_samples)));
+                            } else {
+                                overlay.done(useq, DoneKind::Dismissed);
+                            }
                         }
                         speech_samples.clear();
                         speech_active = false;
@@ -143,31 +182,28 @@ pub async fn stream_vad(
         }
     }
 
-    // Flush remaining speech
-    if speech_samples.len() >= min_speech_samples {
-        transcribe_chunk(
-            &speech_samples,
-            sample_rate,
-            &chunk_file,
-            provider,
-            &state.lang,
-            &state.languages,
-            &model,
-            &state.vocabulary,
-            state.remove_fillers,
-            &overlay,
-            seq,
-            &state.output,
-            &transcript_file,
-            &mut full_transcript,
-        )
-        .await;
+    // Flush the in-progress utterance at stop through the same live path.
+    if let Some(useq) = current_seq.take() {
+        if speech_samples.len() >= min_speech_samples {
+            overlay.processing(useq, 0.0);
+            let _ = chunk_tx.send((useq, std::mem::take(&mut speech_samples)));
+        } else {
+            overlay.done(useq, DoneKind::Dismissed);
+        }
     }
 
-    Ok(full_transcript)
+    drop(chunk_tx);
+    Ok(worker.await.unwrap_or_default())
 }
 
-async fn transcribe_chunk(
+/// Transcribe one utterance and deliver it immediately (live), driving its overlay bubble to a Done
+/// state. Each chunk is a whole utterance (the VAD cuts at silences, never mid-word), so per-chunk
+/// transcription preserves accuracy. NOTE: AssemblyAI's batch API rejects short/no-speech chunks
+/// ("language_detection cannot be performed on files with no spoken audio"), so this live mode is
+/// meant for a short-chunk-tolerant, fast provider like groq/whisper-large-v3-turbo — but the
+/// configured model/provider is used as-is, never hardcoded.
+#[allow(clippy::too_many_arguments)]
+async fn transcribe_and_deliver(
     samples: &[i16],
     sample_rate: u32,
     chunk_file: &PathBuf,
@@ -179,32 +215,49 @@ async fn transcribe_chunk(
     remove_fillers: bool,
     overlay: &overlay::Handle,
     seq: u64,
-    _output_mode: &str,
+    output_mode: &str,
+    auto_paste: bool,
     transcript_file: &PathBuf,
     full_transcript: &mut String,
 ) {
     let wav = encode_wav(samples, sample_rate);
     if let Err(e) = tokio::fs::write(chunk_file, &wav).await {
         tracing::error!("failed to write chunk: {e}");
+        overlay.done(seq, DoneKind::Failed);
         return;
     }
 
-    overlay.processing(seq, 0.0);
-
     match daemon::transcribe_with_retry(chunk_file, provider, lang, languages, model, vocabulary, remove_fillers).await {
-        Ok(transcript) if !transcript.is_empty() => {
+        Ok(transcript) if !transcript.trim().is_empty() => {
+            let text = transcript.trim();
             if !full_transcript.is_empty() && !full_transcript.ends_with(' ') {
                 full_transcript.push(' ');
             }
-            full_transcript.push_str(&transcript);
-            output::copy_to_clipboard(full_transcript);
-            // Delivery happens once in finalize (input-method commit or clipboard paste), so it
-            // works in apps without Wayland text-input — no per-chunk char typing here.
+            full_transcript.push_str(text);
             let _ = tokio::fs::write(transcript_file, full_transcript.as_str()).await;
-            overlay.set_text(full_transcript.clone());
+
+            // Deliver this utterance now; trailing space so back-to-back utterances don't merge.
+            let insert = format!("{text} ");
+            output::copy_to_clipboard(&insert);
+            let kind = if output_mode == "clipboard" {
+                DoneKind::Copied
+            } else if output::type_text(&insert) {
+                DoneKind::Delivered
+            } else {
+                output::paste(auto_paste);
+                if auto_paste {
+                    DoneKind::Delivered
+                } else {
+                    DoneKind::Copied
+                }
+            };
+            overlay.done(seq, kind);
         }
-        Err(e) => tracing::error!("vad transcribe error: {e}"),
-        _ => {}
+        Ok(_) => overlay.done(seq, DoneKind::Dismissed),
+        Err(e) => {
+            tracing::error!("vad transcribe error: {e}");
+            overlay.done(seq, DoneKind::Failed);
+        }
     }
 
     let _ = tokio::fs::remove_file(chunk_file).await;

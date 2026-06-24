@@ -20,8 +20,9 @@ use crate::sound;
 use crate::transcript::TranscriptEvent;
 use crate::tray;
 
-/// Monotonic id per recording, so each batch capture gets its own temp file.
-static REC_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic id per recording, so each batch capture gets its own temp file. VAD mints one per
+/// utterance from here too, so live chunks share the same overlay-bubble id space.
+pub(crate) static REC_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Below this RMS (mean energy) a capture is treated as silence and skipped. RMS — not peak —
 /// because peak-max grows with clip length, which systematically dropped short utterances; RMS is
 /// length-independent. Lenient: push-to-talk is deliberate, so err toward keeping the capture.
@@ -306,7 +307,10 @@ impl DaemonState {
         let overlay_mode = self.state.overlay_mode();
         if overlay_mode != config::OverlayMode::Off {
             self.overlay.set_status_only(overlay_mode == config::OverlayMode::Status);
-            self.overlay.start(seq);
+            // VAD mints a fresh bubble per utterance, so skip the session-level one for that mode.
+            if self.state.mode != "vad" {
+                self.overlay.start(seq);
+            }
             self.overlay.set_info(self.state.mode.clone(), self.state.lang.clone());
         }
 
@@ -563,10 +567,12 @@ impl DaemonState {
                 }
             };
             let samples: Vec<i16> = samples_buf.lock().unwrap().clone();
+            // VAD delivers each utterance live (typed per chunk), so finalize must NOT re-type —
+            // already_typed=true makes it only record history/clipboard/archive for the session.
             finalize_transcript(
                 full_transcript, do_correct, correct_hold_ms, &lang,
                 &state.mode, &state.model, 0,
-                enter_after, is_clipboard, false, state.auto_paste,
+                enter_after, is_clipboard, true, state.auto_paste,
                 &overlay_handle, seq, &transcript_file, &history_file,
                 &audio_dir, Some((&samples, sample_rate)),
             ).await;
