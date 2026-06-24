@@ -22,8 +22,14 @@ use crate::tray;
 
 /// Monotonic id per recording, so each batch capture gets its own temp file.
 static REC_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Peak i16 amplitude below which a capture is treated as silence (no speech) and skipped.
-const SILENCE_PEAK: u16 = 500;
+/// Below this RMS (mean energy) a capture is treated as silence and skipped. RMS — not peak —
+/// because peak-max grows with clip length, which systematically dropped short utterances; RMS is
+/// length-independent. Lenient: push-to-talk is deliberate, so err toward keeping the capture.
+const SILENCE_RMS: f32 = 12.0;
+/// Gain-normalize a capture up to this peak before transcription, so a quiet/attenuated mic still
+/// reaches the provider at a usable level. Capped (NORM_MAX_GAIN) so near-silence isn't blown up.
+const NORM_TARGET_PEAK: f32 = 8000.0;
+const NORM_MAX_GAIN: f32 = 20.0;
 
 #[derive(serde::Deserialize)]
 struct HistRow {
@@ -474,17 +480,43 @@ impl DaemonState {
             // rejects with "no spoken audio"): just dismiss the overlay. Peak amplitude is a
             // cheap speech proxy — real speech peaks in the thousands, room noise stays low.
             let peak = samples_for_archive.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            let rms = if samples_for_archive.is_empty() {
+                0.0
+            } else {
+                (samples_for_archive.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
+                    / samples_for_archive.len() as f64)
+                    .sqrt() as f32
+            };
             let dur_ms = if archive_rate > 0 {
                 samples_for_archive.len() as u64 * 1000 / archive_rate as u64
             } else {
                 0
             };
-            tracing::info!("batch capture: {dur_ms}ms, peak {peak}, provider {provider}");
-            if samples_for_archive.is_empty() || peak < SILENCE_PEAK {
-                tracing::info!("no speech detected (peak {peak} < {SILENCE_PEAK}) — skipping");
+            tracing::info!("batch capture: {dur_ms}ms, peak {peak}, rms {rms:.0}, provider {provider}");
+            if samples_for_archive.is_empty() || rms < SILENCE_RMS {
+                tracing::info!("no speech detected (rms {rms:.0} < {SILENCE_RMS}) — skipping");
                 overlay_handle.done(seq, DoneKind::Dismissed);
                 let _ = fs::remove_file(&audio_file);
                 return;
+            }
+            // Gain-normalize a copy for the provider; the archive (in finalize) keeps the raw samples.
+            let gain = if peak > 0 {
+                (NORM_TARGET_PEAK / peak as f32).clamp(1.0, NORM_MAX_GAIN)
+            } else {
+                1.0
+            };
+            if gain > 1.01 {
+                let normalized: Vec<i16> = samples_for_archive
+                    .iter()
+                    .map(|&s| (s as f32 * gain).clamp(-32768.0, 32767.0) as i16)
+                    .collect();
+                match audio::write_wav(&audio_file, &normalized, archive_rate) {
+                    Ok(()) => tracing::info!(
+                        "normalized gain {gain:.1}x (peak {peak} -> {})",
+                        (peak as f32 * gain) as u32
+                    ),
+                    Err(e) => tracing::warn!("normalize write failed, using raw audio: {e}"),
+                }
             }
 
             // Countdown the estimated wait (rolling per-provider latency vs this clip's length).

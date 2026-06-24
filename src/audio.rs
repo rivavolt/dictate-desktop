@@ -233,3 +233,20 @@ pub fn record_to_file(path: &std::path::Path, stop: Arc<AtomicBool>, audio_level
     writer.finalize()?;
     Ok(())
 }
+
+/// Write i16 mono samples to a WAV file — used to hand a gain-normalized copy of a capture to the
+/// transcription provider while the archived recording keeps the raw samples.
+pub fn write_wav(path: &std::path::Path, samples: &[i16], sample_rate: u32) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: CHANNELS,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &s in samples {
+        writer.write_sample(s)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
