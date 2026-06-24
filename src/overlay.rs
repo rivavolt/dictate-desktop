@@ -48,10 +48,18 @@ const INDICATOR_FADE_MS: f32 = 180.0;  // circle fade-in / done fade-out
 const DONE_HOLD_S: f32 = 0.45;         // hold the done flash + checkmark before fading out
 
 #[derive(Clone, Copy, PartialEq)]
+pub enum DoneKind {
+    Delivered,
+    Copied,
+    Dismissed,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum IndicatorKind {
     Recording,
     Processing,
-    Done,
+    Done(DoneKind),
 }
 
 /// One in-flight utterance's status circle. `phase` drives the pulse/spin, `fade` is 0→1 on
@@ -62,6 +70,7 @@ struct Indicator {
     kind: IndicatorKind,
     phase: f32,
     eta_remaining: f32,
+    eta_set: bool,
     fade: f32,
 }
 
@@ -71,8 +80,8 @@ pub enum Command {
     /// Utterance `id` is now awaiting its transcript; the f32 is the estimated seconds until it
     /// lands (0 = unknown → plain spinner, no countdown).
     Processing(u64, f32),
-    /// Utterance `id` finished — its indicator does a brief "done" pop, then fades out and clears.
-    Done(u64),
+    /// Utterance `id` finished — its indicator shows an outcome (checkmark/clipboard/✕) then fades.
+    Done(u64, DoneKind),
     SetText(String),
     SetPending(String),
     /// Briefly show a one-line message (paste/copy feedback) for ~2.5s, regardless of mode.
@@ -107,8 +116,8 @@ impl Handle {
         let _ = self.tx.send(Command::Processing(id, eta_secs));
     }
 
-    pub fn done(&self, id: u64) {
-        let _ = self.tx.send(Command::Done(id));
+    pub fn done(&self, id: u64, kind: DoneKind) {
+        let _ = self.tx.send(Command::Done(id, kind));
     }
 
     pub fn toast(&self, msg: String) {
@@ -327,9 +336,10 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
                         ind.kind = IndicatorKind::Recording;
                         ind.eta_remaining = 0.0;
+                        ind.eta_set = false;
                     } else {
                         state.indicators.push(Indicator {
-                            id, kind: IndicatorKind::Recording, phase: 0.0, eta_remaining: 0.0, fade: 0.0,
+                            id, kind: IndicatorKind::Recording, phase: 0.0, eta_remaining: 0.0, eta_set: false, fade: 0.0,
                         });
                     }
                     state.last_tick = std::time::Instant::now();
@@ -368,23 +378,24 @@ fn run(cmd_rx: calloop::channel::Channel<Command>, font_name: &str, audio_level:
                     if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
                         ind.kind = IndicatorKind::Processing;
                         ind.eta_remaining = eta;
+                        ind.eta_set = eta > 0.0;
                     } else {
                         state.indicators.push(Indicator {
-                            id, kind: IndicatorKind::Processing, phase: 0.0, eta_remaining: eta, fade: 0.0,
+                            id, kind: IndicatorKind::Processing, phase: 0.0, eta_remaining: eta, eta_set: eta > 0.0, fade: 0.0,
                         });
                     }
                     state.visible = true;
                     state.fade_target = 1.0;
                     state.resize_and_redraw();
                 }
-                Command::Done(id) => {
+                Command::Done(id, kind) => {
                     if let Some(ind) = state.indicators.iter_mut().find(|i| i.id == id) {
-                        ind.kind = IndicatorKind::Done;
+                        ind.kind = IndicatorKind::Done(kind);
                         ind.phase = 0.0;
-                        ind.eta_remaining = DONE_HOLD_S; // hold the flash + checkmark before fading
+                        // Dismissed (no speech) fades out immediately; the rest hold their flash/icon.
+                        ind.eta_remaining = if kind == DoneKind::Dismissed { 0.0 } else { DONE_HOLD_S };
                     }
-                    // Full mode: hold the finished transcript briefly, then let it fade (a paste
-                    // toast that follows will override this with its own message + timer).
+                    // Full mode: hold the finished transcript briefly, then let it fade.
                     if !state.status_only && !state.text.is_empty() && state.toast_remaining <= 0.0 {
                         let len_s = (state.text.len() as f32 / 80.0).min(4.0) * 0.5;
                         state.toast_remaining = 1.5 + len_s;
@@ -560,8 +571,8 @@ impl State {
         self.indicators.retain_mut(|ind| {
             ind.phase += std::f32::consts::TAU * dt / 1000.0;
             match ind.kind {
-                // Hold the done circle (flash + checkmark) for DONE_HOLD_S, then fade it out.
-                IndicatorKind::Done => {
+                // Hold the done circle (flash + icon) for DONE_HOLD_S, then fade it out.
+                IndicatorKind::Done(_) => {
                     if ind.eta_remaining > 0.0 {
                         ind.eta_remaining = (ind.eta_remaining - dt / 1000.0).max(0.0);
                     } else {
@@ -575,7 +586,7 @@ impl State {
                     ind.eta_remaining = (ind.eta_remaining - dt / 1000.0).max(0.0);
                 }
             }
-            !(ind.kind == IndicatorKind::Done && ind.fade <= 0.0)
+            !(matches!(ind.kind, IndicatorKind::Done(_)) && ind.fade <= 0.0)
         });
         if !self.indicators.is_empty() {
             needs_redraw = true;
@@ -816,17 +827,27 @@ impl State {
                     self.draw_waveform_bars(cx, cy, icon_area, Color::rgbaf(0.9, 0.27, 0.22, pulse * a));
                 }
                 IndicatorKind::Processing => {
+                    // Amber once the request overruns its (known) ETA, neutral otherwise.
+                    let overrun = ind.eta_set && ind.eta_remaining <= 0.0;
+                    let (cr, cg, cb) = if overrun { (0.95, 0.7, 0.2) } else { (0.92, 0.92, 0.92) };
                     let a0 = ind.phase * (1000.0 / SPINNER_MS);
                     let a1 = a0 + std::f32::consts::PI * 1.3;
                     let mut arc = Path::new();
                     arc.arc(cx, cy, radius * 0.62, a0, a1, femtovg::Solidity::Hole);
-                    let mut arc_paint = Paint::color(Color::rgbaf(0.92, 0.92, 0.92, 0.9 * a));
+                    let mut arc_paint = Paint::color(Color::rgbaf(cr, cg, cb, 0.9 * a));
                     arc_paint.set_line_width(2.5 * sf);
                     self.canvas.stroke_path(&arc, &arc_paint);
-                    if ind.eta_remaining > 0.0 {
-                        let label = format!("{}", ind.eta_remaining.ceil() as u32);
+                    // Countdown number while ticking; "…" once it overruns; nothing if ETA unknown.
+                    let label = if ind.eta_remaining > 0.0 {
+                        Some(format!("{}", ind.eta_remaining.ceil() as u32))
+                    } else if ind.eta_set {
+                        Some("…".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(label) = label {
                         let label_size = d * 0.34;
-                        let mut paint = Paint::color(Color::rgbaf(0.92, 0.92, 0.92, a));
+                        let mut paint = Paint::color(Color::rgbaf(cr, cg, cb, a));
                         paint.set_font(&[self.font_id]);
                         paint.set_font_size(label_size);
                         paint.set_text_baseline(Baseline::Middle);
@@ -834,23 +855,64 @@ impl State {
                         let _ = self.canvas.fill_text(cx - tw / 2.0, cy, &label, &paint);
                     }
                 }
-                IndicatorKind::Done => {
-                    // Green flash at completion, decaying over ~0.18s (phase resets to 0 on Done
-                    // and advances in radians, so TAU*0.18 is roughly one flash's worth).
+                IndicatorKind::Done(kind) => {
+                    // Flash at completion, decaying over ~0.18s (phase resets to 0 on Done and
+                    // advances in radians, so TAU*0.18 is roughly one flash's worth).
                     let flash = (1.0 - ind.phase / (std::f32::consts::TAU * 0.18)).clamp(0.0, 1.0);
-                    if flash > 0.0 {
-                        let mut fl = Path::new();
-                        fl.circle(cx, cy, radius);
-                        self.canvas.fill_path(&fl, &Paint::color(Color::rgbaf(0.3, 0.8, 0.42, 0.55 * flash * a)));
-                    }
                     let cs = icon_area * 0.28;
-                    let mut check = Path::new();
-                    check.move_to(cx - cs, cy);
-                    check.line_to(cx - cs * 0.25, cy + cs * 0.7);
-                    check.line_to(cx + cs, cy - cs * 0.6);
-                    let mut paint = Paint::color(Color::rgbaf(0.5, 0.92, 0.55, a));
-                    paint.set_line_width(3.0 * sf);
-                    self.canvas.stroke_path(&check, &paint);
+                    match kind {
+                        DoneKind::Dismissed => {} // no speech — no icon, fades out immediately
+                        DoneKind::Delivered => {
+                            if flash > 0.0 {
+                                let mut fl = Path::new();
+                                fl.circle(cx, cy, radius);
+                                self.canvas.fill_path(&fl, &Paint::color(Color::rgbaf(0.3, 0.8, 0.42, 0.55 * flash * a)));
+                            }
+                            let mut check = Path::new();
+                            check.move_to(cx - cs, cy);
+                            check.line_to(cx - cs * 0.25, cy + cs * 0.7);
+                            check.line_to(cx + cs, cy - cs * 0.6);
+                            let mut paint = Paint::color(Color::rgbaf(0.5, 0.92, 0.55, a));
+                            paint.set_line_width(3.0 * sf);
+                            self.canvas.stroke_path(&check, &paint);
+                        }
+                        DoneKind::Copied => {
+                            if flash > 0.0 {
+                                let mut fl = Path::new();
+                                fl.circle(cx, cy, radius);
+                                self.canvas.fill_path(&fl, &Paint::color(Color::rgbaf(0.6, 0.62, 0.7, 0.4 * flash * a)));
+                            }
+                            // Clipboard glyph: body + a small tab on top.
+                            let bw = cs * 1.4;
+                            let bh = cs * 1.8;
+                            let top = cy - bh / 2.0;
+                            let mut paint = Paint::color(Color::rgbaf(0.9, 0.9, 0.96, a));
+                            paint.set_line_width(2.2 * sf);
+                            let mut body = Path::new();
+                            body.rounded_rect(cx - bw / 2.0, top, bw, bh, cs * 0.22);
+                            self.canvas.stroke_path(&body, &paint);
+                            let tw = bw * 0.5;
+                            let th = cs * 0.45;
+                            let mut tab = Path::new();
+                            tab.rounded_rect(cx - tw / 2.0, top - th * 0.55, tw, th, th * 0.3);
+                            self.canvas.stroke_path(&tab, &paint);
+                        }
+                        DoneKind::Failed => {
+                            if flash > 0.0 {
+                                let mut fl = Path::new();
+                                fl.circle(cx, cy, radius);
+                                self.canvas.fill_path(&fl, &Paint::color(Color::rgbaf(0.85, 0.25, 0.22, 0.6 * flash * a)));
+                            }
+                            let mut x = Path::new();
+                            x.move_to(cx - cs * 0.7, cy - cs * 0.7);
+                            x.line_to(cx + cs * 0.7, cy + cs * 0.7);
+                            x.move_to(cx + cs * 0.7, cy - cs * 0.7);
+                            x.line_to(cx - cs * 0.7, cy + cs * 0.7);
+                            let mut paint = Paint::color(Color::rgbaf(0.95, 0.5, 0.45, a));
+                            paint.set_line_width(3.0 * sf);
+                            self.canvas.stroke_path(&x, &paint);
+                        }
+                    }
                 }
             }
         }

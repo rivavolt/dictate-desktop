@@ -8,6 +8,7 @@ use crate::assemblyai;
 use crate::audio;
 use crate::config::{self, Config, State};
 use crate::correct;
+use crate::overlay::DoneKind;
 use crate::deepgram;
 use crate::fireworks;
 use crate::fnkey;
@@ -167,19 +168,24 @@ async fn finalize_transcript(
     } else {
         transcript
     };
+    // Whether the transcript actually reached the focused app (vs only the clipboard) — drives the
+    // done circle's icon: checkmark when delivered, clipboard when only copied.
+    let mut delivered = false;
     if !final_text.is_empty() {
         overlay.set_text(final_text.clone());
         output::copy_to_clipboard(&final_text);
         if !is_clipboard && !already_typed {
-            // Input method commits the whole string if a field is focused; otherwise it's already
-            // on the clipboard, so paste it. Either way the circle resolves via done(seq) below.
             let n = final_text.chars().count();
             if output::type_text(&final_text) {
+                delivered = true;
                 tracing::info!("delivered via input-method ({n} chars)");
             } else {
                 tracing::info!("input-method inactive → paste fallback (auto_paste={auto_paste}, {n} chars)");
                 output::paste(auto_paste);
+                delivered = auto_paste;
             }
+        } else if already_typed {
+            delivered = true;
         }
         let _ = std::fs::write(transcript_file, &final_text);
     }
@@ -214,9 +220,16 @@ async fn finalize_transcript(
         let hold = (800 + words * 100).min(correct_hold_ms);
         tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
     }
-    // Resolve this utterance's status circle regardless of delivery path. The "done" signal lives
-    // in the circle itself (a flash + checkmark) — no text-panel toast, which would cover the row.
-    overlay.done(seq);
+    // Resolve this utterance's circle: checkmark if delivered, clipboard if only copied, or an
+    // immediate fade (no icon) when there was no speech.
+    let done_kind = if final_text.is_empty() {
+        DoneKind::Dismissed
+    } else if delivered {
+        DoneKind::Delivered
+    } else {
+        DoneKind::Copied
+    };
+    overlay.done(seq, done_kind);
 }
 
 struct DaemonState {
@@ -469,7 +482,7 @@ impl DaemonState {
             tracing::info!("batch capture: {dur_ms}ms, peak {peak}, provider {provider}");
             if samples_for_archive.is_empty() || peak < SILENCE_PEAK {
                 tracing::info!("no speech detected (peak {peak} < {SILENCE_PEAK}) — skipping");
-                overlay_handle.done(seq);
+                overlay_handle.done(seq, DoneKind::Dismissed);
                 let _ = fs::remove_file(&audio_file);
                 return;
             }
@@ -485,7 +498,9 @@ impl DaemonState {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("batch transcribe error: {e}");
-                    String::new()
+                    overlay_handle.done(seq, DoneKind::Failed);
+                    let _ = fs::remove_file(&audio_file);
+                    return;
                 }
             };
             let latency_ms = t0.elapsed().as_millis() as u64;
