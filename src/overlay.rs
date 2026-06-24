@@ -806,7 +806,9 @@ impl State {
         }
         let row_w = n * d + (n - 1.0) * gap;
         let start_x = (pw - row_w) / 2.0;
-        let cy = pad + ph / 2.0;
+        // Center the circle row in the full layer. The shadow padding is asymmetric (26px top vs
+        // 8px bottom), so the content band's midpoint (pad + ph/2) sits ~9px below the true center.
+        let cy = (pad + ph + SHADOW_PAD_BOT as f32 * sf) / 2.0;
         let radius = d / 2.0;
         for (i, ind) in inds.iter().enumerate() {
             let a = self.fade_alpha * ind.fade.clamp(0.0, 1.0);
