@@ -26,10 +26,6 @@ static REC_SEQ: AtomicU64 = AtomicU64::new(0);
 /// because peak-max grows with clip length, which systematically dropped short utterances; RMS is
 /// length-independent. Lenient: push-to-talk is deliberate, so err toward keeping the capture.
 const SILENCE_RMS: f32 = 12.0;
-/// Gain-normalize a capture up to this peak before transcription, so a quiet/attenuated mic still
-/// reaches the provider at a usable level. Capped (NORM_MAX_GAIN) so near-silence isn't blown up.
-const NORM_TARGET_PEAK: f32 = 8000.0;
-const NORM_MAX_GAIN: f32 = 20.0;
 
 #[derive(serde::Deserialize)]
 struct HistRow {
@@ -179,10 +175,14 @@ async fn finalize_transcript(
     let mut delivered = false;
     if !final_text.is_empty() {
         overlay.set_text(final_text.clone());
-        output::copy_to_clipboard(&final_text);
+        // Trail the inserted text with a space so back-to-back dictations don't butt together; the
+        // stored transcript + history stay clean (unspaced). Trailing (not leading) avoids a stray
+        // space at line starts — which would break code indentation and skip bash history.
+        let insert_text = format!("{final_text} ");
+        output::copy_to_clipboard(&insert_text);
         if !is_clipboard && !already_typed {
-            let n = final_text.chars().count();
-            if output::type_text(&final_text) {
+            let n = insert_text.chars().count();
+            if output::type_text(&insert_text) {
                 delivered = true;
                 tracing::info!("delivered via input-method ({n} chars)");
             } else {
@@ -498,25 +498,6 @@ impl DaemonState {
                 overlay_handle.done(seq, DoneKind::Dismissed);
                 let _ = fs::remove_file(&audio_file);
                 return;
-            }
-            // Gain-normalize a copy for the provider; the archive (in finalize) keeps the raw samples.
-            let gain = if peak > 0 {
-                (NORM_TARGET_PEAK / peak as f32).clamp(1.0, NORM_MAX_GAIN)
-            } else {
-                1.0
-            };
-            if gain > 1.01 {
-                let normalized: Vec<i16> = samples_for_archive
-                    .iter()
-                    .map(|&s| (s as f32 * gain).clamp(-32768.0, 32767.0) as i16)
-                    .collect();
-                match audio::write_wav(&audio_file, &normalized, archive_rate) {
-                    Ok(()) => tracing::info!(
-                        "normalized gain {gain:.1}x (peak {peak} -> {})",
-                        (peak as f32 * gain) as u32
-                    ),
-                    Err(e) => tracing::warn!("normalize write failed, using raw audio: {e}"),
-                }
             }
 
             // Countdown the estimated wait (rolling per-provider latency vs this clip's length).
