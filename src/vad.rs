@@ -251,9 +251,11 @@ async fn transcribe_and_deliver(
             full_transcript.push_str(text);
             let _ = tokio::fs::write(transcript_file, full_transcript.as_str()).await;
 
-            // Deliver this utterance now; trailing space so back-to-back utterances don't merge.
+            // Deliver this utterance. Trailing space so back-to-back utterances don't merge.
             let insert = format!("{text} ");
-            output::copy_to_clipboard(&insert);
+            if output_mode != "clipboard" {
+                output::copy_to_clipboard(&insert); // so the paste fallback pastes this utterance
+            }
             let kind = if output_mode == "clipboard" {
                 DoneKind::Copied
             } else if output::type_text(&insert) {
@@ -266,6 +268,12 @@ async fn transcribe_and_deliver(
                     DoneKind::Copied
                 }
             };
+            // Whenever the utterance wasn't injected live — clipboard mode, or the type path fell
+            // back with auto-paste off — it's left in the clipboard for a manual paste, so put the
+            // whole running transcript there: one paste yields the entire session, accumulated.
+            if matches!(kind, DoneKind::Copied) {
+                output::copy_to_clipboard(&format!("{} ", full_transcript.as_str()));
+            }
             overlay.done(seq, kind);
         }
         Ok(_) => overlay.done(seq, DoneKind::Dismissed),
