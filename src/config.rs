@@ -133,9 +133,9 @@ pub fn lang_name(code: &str) -> Option<&'static str> {
 pub fn provider_models(provider: &str) -> &'static [&'static str] {
     match provider {
         "assemblyai" => &["universal"],
-        "deepgram" => &["nova-3", "nova-2", "nova-2-general", "whisper-large", "whisper-medium", "whisper-small", "whisper-tiny"],
-        "groq" => &["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"],
-        "fireworks" => &["fireworks-asr-large", "whisper-v3-turbo", "whisper-v3"],
+        "deepgram" => &["nova-3", "nova-2", "nova-2-general"],
+        "groq" => &["whisper-large-v3-turbo", "whisper-large-v3"],
+        "fireworks" => &["fireworks-asr-large"],
         _ => &[],
     }
 }
@@ -143,9 +143,8 @@ pub fn provider_models(provider: &str) -> &'static [&'static str] {
 pub const ALL_MODELS: &[&str] = &[
     "assemblyai/universal",
     "deepgram/nova-3", "deepgram/nova-2", "deepgram/nova-2-general",
-    "deepgram/whisper-large", "deepgram/whisper-medium", "deepgram/whisper-small", "deepgram/whisper-tiny",
-    "groq/whisper-large-v3-turbo", "groq/whisper-large-v3", "groq/distil-whisper-large-v3-en",
-    "fireworks/fireworks-asr-large", "fireworks/whisper-v3-turbo", "fireworks/whisper-v3",
+    "groq/whisper-large-v3-turbo", "groq/whisper-large-v3",
+    "fireworks/fireworks-asr-large",
 ];
 
 pub fn all_models() -> Vec<String> {
