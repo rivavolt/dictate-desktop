@@ -35,6 +35,15 @@ fn encode_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
+/// Estimate how long this utterance's transcription will take, for the per-utterance countdown.
+/// Reuses the daemon's batch-history regression when the provider has history; otherwise a light
+/// duration-based guess so the countdown still shows (VAD chunks are short, the provider fast).
+fn chunk_eta(history_file: &std::path::Path, provider: &str, n_samples: usize, sample_rate: u32) -> f32 {
+    let dur_ms = n_samples as u64 * 1000 / (sample_rate.max(1) as u64);
+    daemon::estimate_eta(history_file, provider, dur_ms)
+        .unwrap_or_else(|| (0.5 + dur_ms as f32 / 1000.0 * 0.1).clamp(0.4, 10.0))
+}
+
 /// Continuous voice-activity dictation: detect each utterance (speech bounded by silence) and, the
 /// moment a pause ends it, transcribe + deliver it live — one overlay bubble per utterance, exactly
 /// like batch mode but back-to-back. Detection never blocks on transcription: finished utterances
@@ -50,6 +59,7 @@ pub async fn stream_vad(
     _seq: u64,
     transcript_file: PathBuf,
     chunk_file: PathBuf,
+    history_file: PathBuf,
 ) -> Result<String> {
     let mut detector = earshot::Detector::default();
 
@@ -108,8 +118,6 @@ pub async fn stream_vad(
         full
     });
 
-    let mut frame_count: u64 = 0;
-    let mut voice_total: u64 = 0;
     tracing::info!("vad: stream started, listening");
     while let Some(chunk) = audio_rx.recv().await {
         if stop.load(Ordering::Relaxed) {
@@ -128,13 +136,6 @@ pub async fn stream_vad(
             let vad_samples = audio::resample(&native_frame, sample_rate, VAD_RATE);
             let is_voice = vad_samples.len() >= VAD_FRAME_SAMPLES
                 && detector.predict_i16(&vad_samples[..VAD_FRAME_SAMPLES]) >= VOICE_THRESHOLD;
-            frame_count += 1;
-            if is_voice {
-                voice_total += 1;
-            }
-            if frame_count % 125 == 0 {
-                tracing::info!("vad: {voice_total}/{frame_count} voice frames (resampled {}), speech_active={speech_active}", vad_samples.len());
-            }
 
             if !speech_active {
                 if is_voice {
@@ -176,7 +177,8 @@ pub async fn stream_vad(
                                 // Utterance ended: flip its bubble to processing and hand it to the
                                 // worker, then keep listening immediately (don't block).
                                 tracing::info!("vad: utterance end ({} samples), transcribing", speech_samples.len());
-                                overlay.processing(useq, 0.0);
+                                let eta = chunk_eta(&history_file, provider, speech_samples.len(), sample_rate);
+                                overlay.processing(useq, eta);
                                 let _ = chunk_tx.send((useq, std::mem::take(&mut speech_samples)));
                             } else {
                                 overlay.done(useq, DoneKind::Dismissed);
@@ -197,7 +199,8 @@ pub async fn stream_vad(
     // Flush the in-progress utterance at stop through the same live path.
     if let Some(useq) = current_seq.take() {
         if speech_samples.len() >= min_speech_samples {
-            overlay.processing(useq, 0.0);
+            let eta = chunk_eta(&history_file, provider, speech_samples.len(), sample_rate);
+            overlay.processing(useq, eta);
             let _ = chunk_tx.send((useq, std::mem::take(&mut speech_samples)));
         } else {
             overlay.done(useq, DoneKind::Dismissed);

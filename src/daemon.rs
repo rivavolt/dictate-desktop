@@ -43,7 +43,7 @@ struct HistRow {
 /// Estimate batch transcription latency (seconds) for `provider` at `duration_ms` from recent
 /// history — an affine fit (fixed overhead + per-second rate) over the last samples for this
 /// provider, falling back to the mean, or None when there isn't enough data yet.
-fn estimate_eta(history_jsonl: &std::path::Path, provider: &str, duration_ms: u64) -> Option<f32> {
+pub(crate) fn estimate_eta(history_jsonl: &std::path::Path, provider: &str, duration_ms: u64) -> Option<f32> {
     let content = std::fs::read_to_string(history_jsonl).ok()?;
     let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     for line in content.lines().rev() {
@@ -558,7 +558,7 @@ impl DaemonState {
             let full_transcript = match crate::vad::stream_vad(
                 audio_rx, stop, sample_rate,
                 &provider, &state, overlay_handle.clone(), seq,
-                transcript_file.clone(), chunk_file,
+                transcript_file.clone(), chunk_file, history_file.clone(),
             ).await {
                 Ok(t) => t,
                 Err(e) => {
