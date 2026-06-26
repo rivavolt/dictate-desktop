@@ -131,6 +131,7 @@ async fn finalize_transcript(
     transcript_file: &std::path::Path,
     history_file: &std::path::Path,
     audio_dir: &std::path::Path,
+    pre_archived_name: Option<String>,
     audio_samples: Option<(&[i16], u32)>,
 ) {
     let raw = transcript.clone();
@@ -145,12 +146,17 @@ async fn finalize_transcript(
     if let Some((samples, sample_rate)) = audio_samples {
         if !samples.is_empty() {
             duration_ms = samples.len() as u64 * 1000 / (sample_rate.max(1)) as u64;
-            let _ = fs::create_dir_all(audio_dir);
-            let name = format!("{stamp}.flac");
-            if let Err(e) = audio::save_flac(&audio_dir.join(&name), samples, sample_rate) {
-                tracing::warn!("failed to archive audio: {e}");
-            } else {
+            if let Some(name) = pre_archived_name {
+                // Already saved at capture-time, so a transcribe failure can't lose it.
                 audio_name = Some(name);
+            } else {
+                let _ = fs::create_dir_all(audio_dir);
+                let name = format!("{stamp}.flac");
+                if let Err(e) = audio::save_flac(&audio_dir.join(&name), samples, sample_rate) {
+                    tracing::warn!("failed to archive audio: {e}");
+                } else {
+                    audio_name = Some(name);
+                }
             }
         }
     }
@@ -411,7 +417,7 @@ impl DaemonState {
                     &mode, &model, 0,
                     enter_after, is_clipboard, ime_used, auto_paste,
                     &overlay_handle, seq, &transcript_file, &history_file,
-                    &audio_dir, Some((&samples, sample_rate)),
+                    &audio_dir, None, Some((&samples, sample_rate)),
                 ).await;
             });
 
@@ -504,6 +510,15 @@ impl DaemonState {
                 return;
             }
 
+            // Archive the recording NOW, before transcription, so a provider failure or timeout can
+            // never erase it — it stays in audio_dir, recoverable and retryable. finalize reuses this
+            // name (won't re-save), and the history row links to it.
+            let _ = fs::create_dir_all(&audio_dir);
+            let archived_name = format!("{}.flac", chrono::Local::now().format("%Y%m%d-%H%M%S%.3f"));
+            if let Err(e) = audio::save_flac(&audio_dir.join(&archived_name), &samples_for_archive, archive_rate) {
+                tracing::warn!("failed to archive audio: {e}");
+            }
+
             // Countdown the estimated wait (rolling per-provider latency vs this clip's length).
             let jsonl = history_file.with_file_name("history.jsonl");
             let eta = estimate_eta(&jsonl, &provider, dur_ms).unwrap_or(0.0);
@@ -514,7 +529,9 @@ impl DaemonState {
             let transcript = match transcribe_with_retry(&audio_file, &provider, &state.lang, &state.languages, model, &state.vocabulary, state.remove_fillers).await {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::error!("batch transcribe error: {e}");
+                    // The .flac is already archived above, so the recording is NOT lost — only the
+                    // temp WAV is removed. It can be re-transcribed from audio_dir.
+                    tracing::error!("batch transcribe error: {e} (audio kept as {archived_name})");
                     overlay_handle.done(seq, DoneKind::Failed);
                     let _ = fs::remove_file(&audio_file);
                     return;
@@ -528,7 +545,7 @@ impl DaemonState {
                 &state.mode, &state.model, latency_ms,
                 enter_after, is_clipboard, false, state.auto_paste,
                 &overlay_handle, seq, &transcript_file, &history_file,
-                &audio_dir, Some((&samples_for_archive, archive_rate)),
+                &audio_dir, Some(archived_name), Some((&samples_for_archive, archive_rate)),
             ).await;
             let _ = fs::remove_file(&audio_file);
         }));
@@ -574,7 +591,7 @@ impl DaemonState {
                 &state.mode, &state.model, 0,
                 enter_after, is_clipboard, true, state.auto_paste,
                 &overlay_handle, seq, &transcript_file, &history_file,
-                &audio_dir, Some((&samples, sample_rate)),
+                &audio_dir, None, Some((&samples, sample_rate)),
             ).await;
         }));
 
