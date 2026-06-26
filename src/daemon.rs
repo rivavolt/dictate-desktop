@@ -1026,6 +1026,25 @@ pub async fn run() -> Result<()> {
     let config = Config::new();
     let state = State::load(&config);
 
+    // Single-instance guard: if a daemon already answers on the IPC socket, defer to it and exit
+    // before spawning the tray/overlay — so a duplicate (e.g. the prod service starting under a
+    // running dev daemon, or vice-versa) never flashes a second tray icon or fights over the
+    // trigger key. The socket is the lock; we probe it rather than blindly stealing it.
+    if tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::UnixStream::connect(&config.socket_path),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+    {
+        tracing::warn!(
+            "another dictate-desktop daemon already running on {} — exiting",
+            config.socket_path.display()
+        );
+        return Ok(());
+    }
+
     // Start the input-method client up front (see output.rs).
     output::init();
 
