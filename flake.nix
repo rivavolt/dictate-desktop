@@ -68,6 +68,20 @@
           };
         };
 
+      homeManagerModules.default = { config, lib, pkgs, ... }:
+        let cfg = config.services.dictate-desktop;
+        in {
+          options.services.dictate-desktop.settings = lib.mkOption {
+            type = lib.types.attrsOf lib.types.anything;
+            default = { };
+            description = "Nix-forced defaults written to defaults.toml; layered over config.toml so it overrides runtime/GUI changes on rebuild.";
+          };
+          config = lib.mkIf (cfg.settings != { }) {
+            xdg.configFile."dictate-desktop/defaults.toml".source =
+              (pkgs.formats.toml { }).generate "dictate-desktop-defaults.toml" cfg.settings;
+          };
+        };
+
       devShells = forAllSystems ({ pkgs }: let
         # `dev` runs the daemon from source: it stops the installed user service first
         # (one daemon at a time owns the socket, audio device, tray and Fn-key socket),

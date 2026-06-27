@@ -159,6 +159,8 @@ pub struct Config {
     pub history_file: PathBuf,
     pub audio_dir: PathBuf,
     pub socket_path: PathBuf,
+    /// Nix-managed read-only defaults (defaults.toml), layered over config.toml in `load`.
+    pub defaults_file: PathBuf,
 }
 
 impl Config {
@@ -183,6 +185,7 @@ impl Config {
             history_file: state_dir.join("history.log"),
             audio_dir: state_dir.join("audio"),
             socket_path: runtime_dir.join("dictate-desktop.sock"),
+            defaults_file: config_dir.join("defaults.toml"),
         }
     }
 }
@@ -251,8 +254,8 @@ pub struct State {
     pub model: String,
     #[serde(default = "default_mode")]
     pub mode: String,
-    #[serde(default = "default_output")]
-    pub output: String,
+    #[serde(default = "default_delivery")]
+    pub delivery: String,
     #[serde(default)]
     pub enter: bool,
     #[serde(default = "default_true")]
@@ -277,17 +280,18 @@ pub struct State {
     /// Maps to AssemblyAI `disfluencies=false` / Deepgram `filler_words=false`.
     #[serde(default = "default_true")]
     pub remove_fillers: bool,
-    /// When typing (output = type) into an app without Wayland input-method support (kitty/TUIs,
-    /// XWayland), synthesize a paste (Ctrl+Shift+V) instead of leaving it clipboard-only. Either
-    /// way a toast fires. Off = copy + toast, paste manually.
-    #[serde(default = "default_true")]
-    pub auto_paste: bool,
+    /// Superseded by `delivery`; deserialized only to migrate pre-`delivery` configs in `load`,
+    /// and never written back (skip_serializing).
+    #[serde(default, skip_serializing)]
+    output: Option<String>,
+    #[serde(default, skip_serializing)]
+    auto_paste: Option<bool>,
 }
 
 fn default_lang() -> String { std::env::var("DICTATE_LANG").unwrap_or_else(|_| AUTO_LANG.to_string()) }
-fn default_model() -> String { std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "assemblyai/universal".to_string()) }
+fn default_model() -> String { std::env::var("DICTATE_MODEL").unwrap_or_else(|_| "groq/whisper-large-v3-turbo".to_string()) }
 fn default_mode() -> String { "live".to_string() }
-fn default_output() -> String { "type".to_string() }
+fn default_delivery() -> String { std::env::var("DICTATE_DELIVERY").unwrap_or_else(|_| "auto".to_string()) }
 fn default_true() -> bool { true }
 fn default_correct_hold_ms() -> u64 { 3000 }
 fn default_font() -> String { std::env::var("DICTATE_FONT").unwrap_or_else(|_| "Inter".to_string()) }
@@ -301,12 +305,30 @@ fn default_languages() -> Vec<String> {
 
 impl State {
     pub fn load(config: &Config) -> Self {
-        let mut state: State = fs::read_to_string(&config.config_file)
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_else(|| toml::from_str("").unwrap());
+        // Two layers: the Nix-managed defaults.toml is overlaid OVER the runtime config.toml, so a
+        // Home-Manager-forced key (mkForce) re-asserts on every start, while config.toml (written by
+        // tray/CLI changes) owns every key Nix did not set.
+        let user_raw = fs::read_to_string(&config.config_file).unwrap_or_default();
+        let defaults_raw = fs::read_to_string(&config.defaults_file).unwrap_or_default();
+        let mut merged: toml::Table = toml::from_str(&user_raw).unwrap_or_default();
+        if let Ok(defaults) = toml::from_str::<toml::Table>(&defaults_raw) {
+            merged.extend(defaults);
+        }
+        let has_delivery = merged.contains_key("delivery");
+        let merged_str = toml::to_string(&merged).unwrap_or_default();
+        let mut state: State = toml::from_str(&merged_str).unwrap_or_else(|_| toml::from_str("").unwrap());
         if state.lang == "multi" {
             state.lang = AUTO_LANG.to_string();
+        }
+        // Migrate pre-`delivery` configs: old `output` + `auto_paste` collapse into `delivery`, but
+        // only when neither layer set a `delivery` key (a config already on the new model is left be).
+        if !has_delivery {
+            state.delivery = match (state.output.as_deref(), state.auto_paste) {
+                (Some("clipboard"), _) => "clipboard",
+                (_, Some(false)) => "type",
+                _ => "auto",
+            }
+            .to_string();
         }
         state
     }
@@ -317,14 +339,11 @@ impl State {
         }
     }
 
-    /// Whether the overlay panel should be shown: an explicit override if set, otherwise
-    /// the mode default — off for direct typing (text lands in the focused app), on for
-    /// clipboard (where the panel is the only view of the transcript).
-    /// Resolved overlay mode: explicit override, else the output-mode default — a
-    /// status-only pill for direct typing (text lands in the focused app, so no panel),
-    /// the full text panel for clipboard (where the panel is the only view).
+    /// Resolved overlay mode: explicit override, else the delivery-mode default — a status-only
+    /// pill for the injecting modes (auto/type land text in the focused app, so no panel), the
+    /// full text panel for clipboard (where the panel is the only view of the transcript).
     pub fn overlay_mode(&self) -> OverlayMode {
         self.overlay
-            .unwrap_or(if self.output == "type" { OverlayMode::Status } else { OverlayMode::Full })
+            .unwrap_or(if self.delivery == "clipboard" { OverlayMode::Full } else { OverlayMode::Status })
     }
 }
