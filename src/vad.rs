@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::audio;
@@ -60,6 +60,7 @@ pub async fn stream_vad(
     transcript_file: PathBuf,
     chunk_file: PathBuf,
     history_file: PathBuf,
+    clip_acc: Arc<Mutex<daemon::ClipboardAccumulator>>,
 ) -> Result<String> {
     let mut detector = earshot::Detector::default();
 
@@ -89,8 +90,8 @@ pub async fn stream_vad(
     let w_model = w_model.to_string();
     let w_vocab = state.vocabulary.clone();
     let w_remove = state.remove_fillers;
-    let w_output = state.output.clone();
-    let w_auto_paste = state.auto_paste;
+    let w_delivery = state.delivery.clone();
+    let w_clip_acc = clip_acc.clone();
     let w_chunk_file = chunk_file.clone();
     let w_transcript_file = transcript_file.clone();
     let worker = tokio::spawn(async move {
@@ -108,8 +109,8 @@ pub async fn stream_vad(
                 w_remove,
                 &w_overlay,
                 useq,
-                &w_output,
-                w_auto_paste,
+                &w_delivery,
+                &w_clip_acc,
                 &w_transcript_file,
                 &mut full,
             )
@@ -230,8 +231,8 @@ async fn transcribe_and_deliver(
     remove_fillers: bool,
     overlay: &overlay::Handle,
     seq: u64,
-    output_mode: &str,
-    auto_paste: bool,
+    delivery: &str,
+    clip_acc: &Arc<Mutex<daemon::ClipboardAccumulator>>,
     transcript_file: &PathBuf,
     full_transcript: &mut String,
 ) {
@@ -253,28 +254,31 @@ async fn transcribe_and_deliver(
 
             // Deliver this utterance. Trailing space so back-to-back utterances don't merge.
             let insert = format!("{text} ");
-            if output_mode != "clipboard" {
-                output::copy_to_clipboard(&insert); // so the paste fallback pastes this utterance
-            }
-            let kind = if output_mode == "clipboard" {
+            let kind = if delivery == "clipboard" {
                 DoneKind::Copied
-            } else if output::type_text(&insert) {
-                DoneKind::Delivered
             } else {
-                output::paste(auto_paste);
-                if auto_paste {
+                output::copy_to_clipboard(&insert); // so the paste fallback pastes this utterance
+                if output::type_text(&insert) {
                     DoneKind::Delivered
                 } else {
-                    DoneKind::Copied
+                    output::paste(delivery == "auto");
+                    if delivery == "auto" {
+                        DoneKind::Delivered
+                    } else {
+                        DoneKind::Copied
+                    }
                 }
             };
-            // Whenever the utterance wasn't injected live — clipboard mode, or the type path fell
-            // back with auto-paste off — it's left in the clipboard for a manual paste, so put the
-            // whole running transcript there: one paste yields the entire session, accumulated.
+            // Whenever the utterance wasn't injected live — clipboard delivery, or the type path
+            // fell back with no auto-paste — it's left for a manual paste, so fold it into the
+            // shared accumulator and write the whole buffer: one paste yields the entire session.
             if matches!(kind, DoneKind::Copied) {
-                output::copy_to_clipboard(&format!("{} ", full_transcript.as_str()));
+                let mut acc = clip_acc.lock().unwrap();
+                acc.append(text);
+                output::copy_to_clipboard(acc.text());
             }
             overlay.done(seq, kind);
+            tracing::info!("vad: seq {seq} delivered ({} chars)", text.len());
         }
         Ok(_) => overlay.done(seq, DoneKind::Dismissed),
         Err(e) => {

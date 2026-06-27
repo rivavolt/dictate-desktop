@@ -55,22 +55,21 @@ fn make_icons() -> TrayIcons {
 pub enum TrayCommand {
     Toggle,
     SetMode(String),
-    SetOutput(String),
+    SetDelivery(String),
     ToggleLang(String),
     SetModel(String),
     SetInput(String),
     ToggleEnter,
     ToggleCorrect,
     ToggleFillers,
-    ToggleAutoPaste,
     SetOverlay(String),
     CopyHistory(String),
 }
 
 const MODES: &[&str] = &["live", "batch", "vad"];
 const MODE_LABELS: &[&str] = &["Live", "Batch", "VAD"];
-const OUTPUTS: &[&str] = &["type", "clipboard"];
-const OUTPUT_LABELS: &[&str] = &["Type", "Clipboard"];
+const DELIVERY: &[&str] = &["auto", "type", "clipboard"];
+const DELIVERY_LABELS: &[&str] = &["Auto", "Type", "Clipboard"];
 const OVERLAY_MODES: &[&str] = &["off", "status", "full"];
 const OVERLAY_LABELS: &[&str] = &["Off", "Status only", "Full"];
 
@@ -107,7 +106,7 @@ fn recent_history(path: &std::path::Path, n: usize) -> Vec<(String, String)> {
 pub struct DictateTray {
     recording: bool,
     mode: usize,
-    output: usize,
+    delivery: usize,
     languages: Vec<String>,
     model: usize,
     input: usize,
@@ -115,7 +114,6 @@ pub struct DictateTray {
     enter: bool,
     correct: bool,
     remove_fillers: bool,
-    auto_paste: bool,
     overlay: usize,
     langs: Vec<(&'static str, &'static str)>,
     history_path: std::path::PathBuf,
@@ -130,7 +128,7 @@ impl DictateTray {
 
     pub fn set_state(&mut self, state: &config::State) {
         self.mode = MODES.iter().position(|&m| m == state.mode).unwrap_or(0);
-        self.output = OUTPUTS.iter().position(|&o| o == state.output).unwrap_or(0);
+        self.delivery = DELIVERY.iter().position(|&d| d == state.delivery).unwrap_or(0);
         self.languages = state.languages.clone();
         self.model = config::ALL_MODELS
             .iter()
@@ -142,7 +140,6 @@ impl DictateTray {
         self.enter = state.enter;
         self.correct = state.correct;
         self.remove_fillers = state.remove_fillers;
-        self.auto_paste = state.auto_paste;
         self.overlay = OVERLAY_MODES.iter().position(|&m| m == state.overlay_mode().name()).unwrap_or(0);
     }
 }
@@ -209,17 +206,17 @@ impl Tray for DictateTray {
         };
 
         let tx = self.cmd_tx.clone();
-        let output_menu = SubMenu {
-            label: "Output".into(),
+        let delivery_menu = SubMenu {
+            label: "Delivery".into(),
             submenu: vec![RadioGroup {
-                selected: self.output,
+                selected: self.delivery,
                 select: Box::new(move |tray: &mut Self, idx| {
-                    tray.output = idx;
-                    if let Some(&o) = OUTPUTS.get(idx) {
-                        let _ = tx.try_send(TrayCommand::SetOutput(o.into()));
+                    tray.delivery = idx;
+                    if let Some(&d) = DELIVERY.get(idx) {
+                        let _ = tx.try_send(TrayCommand::SetDelivery(d.into()));
                     }
                 }),
-                options: OUTPUT_LABELS
+                options: DELIVERY_LABELS
                     .iter()
                     .map(|&l| RadioItem {
                         label: l.into(),
@@ -340,16 +337,6 @@ impl Tray for DictateTray {
             ..Default::default()
         };
 
-        let auto_paste_item = CheckmarkItem {
-            label: "Auto-paste (no IME apps)".into(),
-            checked: self.auto_paste,
-            activate: Box::new(|tray: &mut Self| {
-                tray.auto_paste = !tray.auto_paste;
-                let _ = tray.cmd_tx.try_send(TrayCommand::ToggleAutoPaste);
-            }),
-            ..Default::default()
-        };
-
         let tx = self.cmd_tx.clone();
         let overlay_menu = SubMenu {
             label: "Overlay".into(),
@@ -393,7 +380,7 @@ impl Tray for DictateTray {
 
         vec![
             mode_menu.into(),
-            output_menu.into(),
+            delivery_menu.into(),
             lang_menu.into(),
             model_menu.into(),
             input_menu.into(),
@@ -402,7 +389,6 @@ impl Tray for DictateTray {
             enter_item.into(),
             correct_item.into(),
             fillers_item.into(),
-            auto_paste_item.into(),
             overlay_menu.into(),
         ]
     }
@@ -419,7 +405,7 @@ pub async fn spawn(
     let tray = DictateTray {
         recording: false,
         mode: MODES.iter().position(|&m| m == state.mode).unwrap_or(0),
-        output: OUTPUTS.iter().position(|&o| o == state.output).unwrap_or(0),
+        delivery: DELIVERY.iter().position(|&d| d == state.delivery).unwrap_or(0),
         languages: state.languages.clone(),
         model: config::ALL_MODELS.iter().position(|&m| m == state.model).unwrap_or(0),
         input: input_idx,
@@ -427,7 +413,6 @@ pub async fn spawn(
         enter: state.enter,
         correct: state.correct,
         remove_fillers: state.remove_fillers,
-        auto_paste: state.auto_paste,
         overlay: OVERLAY_MODES.iter().position(|&m| m == state.overlay_mode().name()).unwrap_or(0),
         langs,
         history_path: config::Config::new().history_file.with_file_name("history.jsonl"),

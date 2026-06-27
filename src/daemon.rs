@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::assemblyai;
@@ -113,6 +113,59 @@ pub(crate) async fn transcribe_with_retry(
     Err(last_err.unwrap())
 }
 
+// How long the clipboard accumulator survives between dictations before the next one starts a
+// fresh buffer. Long enough to dictate in bursts (think, dictate, think, dictate); short enough
+// that coming back after a real break gives a clean slate, not stale text. Override with
+// DICTATE_ACCUMULATE_RESET_SECS.
+const ACCUMULATE_RESET_SECS: u64 = 60;
+
+/// Running clipboard buffer for `delivery = clipboard`: every utterance (batch/live) or VAD chunk
+/// is appended and the whole buffer written to the clipboard, so a single paste yields the entire
+/// session. Resets when the idle gap since the last append exceeds the reset window, or when the
+/// delivery mode changes (see the `delivery` command).
+pub(crate) struct ClipboardAccumulator {
+    text: String,
+    last: Option<std::time::Instant>,
+    reset: std::time::Duration,
+}
+
+impl ClipboardAccumulator {
+    fn new() -> Self {
+        let secs = std::env::var("DICTATE_ACCUMULATE_RESET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(ACCUMULATE_RESET_SECS);
+        Self { text: String::new(), last: None, reset: std::time::Duration::from_secs(secs) }
+    }
+
+    /// Append one utterance, first clearing the buffer if it has gone stale (idle gap exceeded).
+    /// Single-spaces the seams and keeps a trailing space, matching the live-typing convention.
+    pub(crate) fn append(&mut self, s: &str) {
+        let now = std::time::Instant::now();
+        if self.last.is_some_and(|t| now.duration_since(t) > self.reset) {
+            self.text.clear();
+        }
+        let s = s.trim();
+        if !s.is_empty() {
+            if !self.text.is_empty() && !self.text.ends_with(' ') {
+                self.text.push(' ');
+            }
+            self.text.push_str(s);
+            self.text.push(' ');
+        }
+        self.last = Some(now);
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.last = None;
+    }
+}
+
 /// Common finalization for all modes: correct → clipboard → file → history → sound → overlay
 async fn finalize_transcript(
     transcript: String,
@@ -123,9 +176,9 @@ async fn finalize_transcript(
     model: &str,
     latency_ms: u64,
     enter_after: bool,
-    is_clipboard: bool,
+    delivery: &str,
     already_typed: bool,
-    auto_paste: bool,
+    clip_acc: Arc<Mutex<ClipboardAccumulator>>,
     overlay: &overlay::Handle,
     seq: u64,
     transcript_file: &std::path::Path,
@@ -135,6 +188,10 @@ async fn finalize_transcript(
     audio_samples: Option<(&[i16], u32)>,
 ) {
     let raw = transcript.clone();
+    // delivery → the two behaviors the body branches on: clipboard never injects; auto fires the
+    // paste-chord fallback when no input-method is focused (type leaves it on the clipboard).
+    let is_clipboard = delivery == "clipboard";
+    let auto_paste = delivery == "auto";
     // One instant for this utterance: the compact form names the FLAC, the RFC3339 form is the
     // JSONL ts — same moment, so the history row and its audio file are linked by construction.
     let now = chrono::Local::now();
@@ -177,6 +234,9 @@ async fn finalize_transcript(
     } else {
         transcript
     };
+    // Whisper prefixes a leading space on its first token; strip it so the delivered text,
+    // history, and stored transcript are all clean (the deliberate trailing space is added below).
+    let final_text = final_text.trim().to_string();
     // Whether the transcript actually reached the focused app (vs only the clipboard) — drives the
     // done circle's icon: checkmark when delivered, clipboard when only copied.
     let mut delivered = false;
@@ -186,19 +246,30 @@ async fn finalize_transcript(
         // stored transcript + history stay clean (unspaced). Trailing (not leading) avoids a stray
         // space at line starts — which would break code indentation and skip bash history.
         let insert_text = format!("{final_text} ");
-        output::copy_to_clipboard(&insert_text);
-        if !is_clipboard && !already_typed {
-            let n = insert_text.chars().count();
-            if output::type_text(&insert_text) {
-                delivered = true;
-                tracing::info!("delivered via input-method ({n} chars)");
-            } else {
-                tracing::info!("input-method inactive → paste fallback (auto_paste={auto_paste}, {n} chars)");
-                output::paste(auto_paste);
-                delivered = auto_paste;
+        if is_clipboard {
+            // Clipboard delivery: never inject. Fold this utterance into the running accumulator
+            // and write the whole buffer out, so one paste yields everything since the last reset.
+            // VAD already accumulates per-chunk (already_typed), so it doesn't re-append here.
+            if !already_typed {
+                let mut acc = clip_acc.lock().unwrap();
+                acc.append(&final_text);
+                output::copy_to_clipboard(acc.text());
             }
-        } else if already_typed {
-            delivered = true;
+        } else {
+            output::copy_to_clipboard(&insert_text);
+            if !already_typed {
+                let n = insert_text.chars().count();
+                if output::type_text(&insert_text) {
+                    delivered = true;
+                    tracing::info!("delivered seq {seq} via input-method ({n} chars)");
+                } else {
+                    tracing::info!("seq {seq}: input-method inactive → paste fallback (auto_paste={auto_paste}, {n} chars)");
+                    output::paste(auto_paste);
+                    delivered = auto_paste;
+                }
+            } else {
+                delivered = true;
+            }
         }
         let _ = std::fs::write(transcript_file, &final_text);
     }
@@ -245,6 +316,67 @@ async fn finalize_transcript(
     overlay.done(seq, done_kind);
 }
 
+/// Orders delivery across concurrent transcriptions: every recording is stamped with a monotonic
+/// `seq` (REC_SEQ), and `wait_turn(seq)` blocks until all lower seqs have finished, so the
+/// inject/paste happens in capture order even though transcriptions race. The RAII `guard` calls
+/// `complete` on every task exit (delivered, skipped, or failed), so a dropped clip cannot stall the
+/// queue; `complete` advances past any seq that finished out of order. One gate backs all modes and
+/// will drive the chunk-during-hold pseudo-VAD.
+pub(crate) struct DeliveryGate {
+    inner: std::sync::Mutex<GateInner>,
+}
+
+struct GateInner {
+    next: u64,
+    done: std::collections::HashSet<u64>,
+}
+
+impl DeliveryGate {
+    fn new() -> Self {
+        Self { inner: std::sync::Mutex::new(GateInner { next: 0, done: std::collections::HashSet::new() }) }
+    }
+
+    /// Block (polling; deliveries are human-paced) until `seq` is next in line to deliver.
+    async fn wait_turn(&self, seq: u64) {
+        loop {
+            if self.inner.lock().unwrap().next >= seq {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Mark `seq` finished and advance `next` past every consecutively-completed seq.
+    fn complete(&self, seq: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.done.insert(seq);
+        loop {
+            let n = g.next;
+            if g.done.remove(&n) {
+                g.next += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn guard(self: &Arc<Self>, seq: u64) -> GateGuard {
+        GateGuard { gate: self.clone(), seq }
+    }
+}
+
+/// Completes its seq on drop, so any task exit (success, skip, error, cancel) advances the gate.
+struct GateGuard {
+    gate: Arc<DeliveryGate>,
+    seq: u64,
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.gate.complete(self.seq);
+    }
+}
+
 struct DaemonState {
     config: Config,
     state: State,
@@ -254,6 +386,8 @@ struct DaemonState {
     record_handle: Option<tokio::task::JoinHandle<()>>,
     tray_handle: Option<ksni::Handle<tray::DictateTray>>,
     overlay: overlay::Handle,
+    clip_acc: Arc<Mutex<ClipboardAccumulator>>,
+    delivery_gate: Arc<DeliveryGate>,
 }
 
 impl DaemonState {
@@ -267,6 +401,8 @@ impl DaemonState {
             record_handle: None,
             tray_handle,
             overlay,
+            clip_acc: Arc::new(Mutex::new(ClipboardAccumulator::new())),
+            delivery_gate: Arc::new(DeliveryGate::new()),
         }
     }
 
@@ -361,7 +497,8 @@ impl DaemonState {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<TranscriptEvent>();
 
-        let is_clipboard = self.state.output == "clipboard";
+        let delivery = self.state.delivery.clone();
+        let is_clipboard = delivery == "clipboard";
         let enter_after = self.state.enter;
         let do_correct = self.state.correct;
         let correct_hold_ms = self.state.correct_hold_ms;
@@ -372,7 +509,7 @@ impl DaemonState {
         let overlay_handle = self.overlay.clone();
         let mode = self.state.mode.clone();
         let model = self.state.model.clone();
-        let auto_paste = self.state.auto_paste;
+        let clip_acc = self.clip_acc.clone();
         let state = self.state.clone();
         let provider = provider.to_string();
         self.record_handle = Some(tokio::spawn(async move {
@@ -415,7 +552,7 @@ impl DaemonState {
                 finalize_transcript(
                     last_accumulated, do_correct, correct_hold_ms, &lang,
                     &mode, &model, 0,
-                    enter_after, is_clipboard, ime_used, auto_paste,
+                    enter_after, &delivery, ime_used, clip_acc,
                     &overlay_handle, seq, &transcript_file, &history_file,
                     &audio_dir, None, Some((&samples, sample_rate)),
                 ).await;
@@ -445,12 +582,14 @@ impl DaemonState {
         // Per-utterance temp file (keyed by seq): a unique path lets a fast re-trigger record into
         // its own file while the previous transcription is still reading the old one.
         let audio_file = self.config.audio_file.with_extension(format!("{seq}.wav"));
+        let delivery_gate = self.delivery_gate.clone();
         let state = self.state.clone();
         let enter_after = self.state.enter;
         let do_correct = self.state.correct;
         let correct_hold_ms = self.state.correct_hold_ms;
         let lang = self.state.lang.clone();
-        let is_clipboard = self.state.output == "clipboard";
+        let delivery = self.state.delivery.clone();
+        let clip_acc = self.clip_acc.clone();
         let transcript_file = self.config.transcript_file.clone();
         let history_file = self.config.history_file.clone();
         let audio_dir = self.config.audio_dir.clone();
@@ -461,6 +600,7 @@ impl DaemonState {
         let input_device = self.state.input.clone();
         self.record_handle = Some(tokio::spawn(async move {
             let audio_file2 = audio_file.clone();
+            let _gate_guard = delivery_gate.guard(seq);
             let stop2 = stop.clone();
             let record = tokio::task::spawn_blocking(move || {
                 audio::record_to_file(&audio_file2, stop2, audio_level, &input_device)
@@ -503,8 +643,12 @@ impl DaemonState {
                 0
             };
             tracing::info!("batch capture: {dur_ms}ms, peak {peak}, rms {rms:.0}, provider {provider}");
-            if samples_for_archive.is_empty() || rms < SILENCE_RMS {
-                tracing::info!("no speech detected (rms {rms:.0} < {SILENCE_RMS}) — skipping");
+            // Whisper hallucinates stock phrases ("thank you", "you") on sub-speech clips — a ~43ms
+            // tap is the worst offender. Drop anything too short to be speech, plus silence. The
+            // duration floor is whisper-safe (a real whisper is still seconds); rms stays gentle so
+            // it doesn't eat quiet/whispered speech (an avg_logprob filter is the secondary net).
+            if samples_for_archive.is_empty() || dur_ms < 300 || rms < SILENCE_RMS {
+                tracing::info!("skipping non-speech: {dur_ms}ms rms {rms:.0} (need ≥300ms & rms ≥{SILENCE_RMS}) — avoids Whisper hallucinations");
                 overlay_handle.done(seq, DoneKind::Dismissed);
                 let _ = fs::remove_file(&audio_file);
                 return;
@@ -538,12 +682,13 @@ impl DaemonState {
                 }
             };
             let latency_ms = t0.elapsed().as_millis() as u64;
-            tracing::info!("transcribed in {latency_ms}ms ({} chars) via {}", transcript.len(), state.model);
+            tracing::info!("transcribed seq {seq} in {latency_ms}ms ({} chars) via {}", transcript.len(), state.model);
+            delivery_gate.wait_turn(seq).await;
 
             finalize_transcript(
                 transcript, do_correct, correct_hold_ms, &lang,
                 &state.mode, &state.model, latency_ms,
-                enter_after, is_clipboard, false, state.auto_paste,
+                enter_after, &delivery, false, clip_acc,
                 &overlay_handle, seq, &transcript_file, &history_file,
                 &audio_dir, Some(archived_name), Some((&samples_for_archive, archive_rate)),
             ).await;
@@ -559,7 +704,8 @@ impl DaemonState {
         self._audio_stream = Some(stream);
 
         let state = self.state.clone();
-        let is_clipboard = self.state.output == "clipboard";
+        let delivery = self.state.delivery.clone();
+        let clip_acc = self.clip_acc.clone();
         let enter_after = self.state.enter;
         let do_correct = self.state.correct;
         let correct_hold_ms = self.state.correct_hold_ms;
@@ -575,7 +721,7 @@ impl DaemonState {
             let full_transcript = match crate::vad::stream_vad(
                 audio_rx, stop, sample_rate,
                 &provider, &state, overlay_handle.clone(), seq,
-                transcript_file.clone(), chunk_file, history_file.clone(),
+                transcript_file.clone(), chunk_file, history_file.clone(), clip_acc.clone(),
             ).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -589,7 +735,7 @@ impl DaemonState {
             finalize_transcript(
                 full_transcript, do_correct, correct_hold_ms, &lang,
                 &state.mode, &state.model, 0,
-                enter_after, is_clipboard, true, state.auto_paste,
+                enter_after, &delivery, true, clip_acc,
                 &overlay_handle, seq, &transcript_file, &history_file,
                 &audio_dir, None, Some((&samples, sample_rate)),
             ).await;
@@ -645,8 +791,8 @@ impl DaemonState {
             "status" => {
                 let status = if self.recording { "recording" } else { "idle" };
                 ipc::Response::ok(format!(
-                    "{} (mode: {}, output: {}, overlay: {}, lang: {}, model: {}, preferred: [{}])",
-                    status, self.state.mode, self.state.output,
+                    "{} (mode: {}, delivery: {}, overlay: {}, lang: {}, model: {}, preferred: [{}])",
+                    status, self.state.mode, self.state.delivery,
                     self.state.overlay_mode().name(),
                     self.state.lang, self.state.model,
                     self.state.languages.join(", ")
@@ -817,27 +963,40 @@ impl DaemonState {
                     ipc::Response::ok(format!("correct-hold: {}ms", self.state.correct_hold_ms))
                 }
             }
-            "output" => {
-                if let Some(o) = req.arg {
-                    if ["type", "clipboard"].contains(&o.as_str()) {
-                        self.state.output = o.clone();
-                        // Drop any explicit override so the overlay follows the new mode's
-                        // default (off for type, on for clipboard).
+            "delivery" => {
+                if let Some(d) = req.arg {
+                    if ["auto", "type", "clipboard"].contains(&d.as_str()) {
+                        self.state.delivery = d.clone();
+                        // Drop any explicit override so the overlay follows the new mode's default
+                        // (status pill for auto/type, full panel for clipboard).
                         self.state.overlay = None;
+                        // A new delivery mode starts a fresh accumulation.
+                        self.clip_acc.lock().unwrap().clear();
                         self.state.save(&self.config);
                         ipc::Response::ok(format!(
-                            "output: {o} (overlay: {})",
+                            "delivery: {d} (overlay: {})",
                             self.state.overlay_mode().name()
                         ))
                     } else {
-                        ipc::Response::err(format!("invalid output '{}'. use: type, clipboard", o))
+                        ipc::Response::err(format!("invalid delivery '{}'. use: auto, type, clipboard", d))
                     }
                 } else {
                     ipc::Response::ok(format!(
-                        "output: {} (available: type, clipboard)",
-                        self.state.output
+                        "delivery: {} (available: auto, type, clipboard)",
+                        self.state.delivery
                     ))
                 }
+            }
+            "output" => {
+                // Back-compat shim for the old type|clipboard knob: type→auto (inject with the
+                // paste-chord fallback, the old default), clipboard→clipboard.
+                let mapped = match req.arg.as_deref() {
+                    Some("clipboard") => Some("clipboard".to_string()),
+                    Some("type") => Some("auto".to_string()),
+                    None => None,
+                    Some(o) => return ipc::Response::err(format!("invalid output '{o}'. use: type, clipboard")),
+                };
+                return self.handle_command(ipc::Request { command: "delivery".into(), arg: mapped });
             }
             "overlay" => match req.arg.as_deref() {
                 None => ipc::Response::ok(format!(
@@ -1008,14 +1167,18 @@ impl DaemonState {
                 ipc::Response::ok(format!("filler removal: {}", if self.state.remove_fillers { "on" } else { "off" }))
             }
             "paste" => {
-                match req.arg.as_deref() {
-                    Some("on") => self.state.auto_paste = true,
-                    Some("off") => self.state.auto_paste = false,
-                    None => self.state.auto_paste = !self.state.auto_paste,
-                    Some(_) => return ipc::Response::err("use: on, off"),
+                // Back-compat shim: auto-paste on/off now picks between the `auto` and `type`
+                // deliveries (no effect under clipboard delivery, which never injects).
+                if self.state.delivery != "clipboard" {
+                    self.state.delivery = match req.arg.as_deref() {
+                        Some("on") => "auto".into(),
+                        Some("off") => "type".into(),
+                        None => if self.state.delivery == "auto" { "type".into() } else { "auto".into() },
+                        Some(_) => return ipc::Response::err("use: on, off"),
+                    };
+                    self.state.save(&self.config);
                 }
-                self.state.save(&self.config);
-                ipc::Response::ok(format!("auto-paste: {}", if self.state.auto_paste { "on" } else { "off" }))
+                ipc::Response::ok(format!("auto-paste: {}", if self.state.delivery == "auto" { "on" } else { "off" }))
             }
             other => ipc::Response::err(format!("unknown command: {}", other)),
         }
@@ -1114,8 +1277,8 @@ pub async fn run() -> Result<()> {
                     tray::TrayCommand::SetMode(m) => {
                         daemon.handle_command(ipc::Request { command: "mode".into(), arg: Some(m) });
                     }
-                    tray::TrayCommand::SetOutput(o) => {
-                        daemon.handle_command(ipc::Request { command: "output".into(), arg: Some(o) });
+                    tray::TrayCommand::SetDelivery(d) => {
+                        daemon.handle_command(ipc::Request { command: "delivery".into(), arg: Some(d) });
                     }
                     tray::TrayCommand::ToggleLang(code) => {
                         if let Some(pos) = daemon.state.languages.iter().position(|c| c == &code) {
@@ -1143,9 +1306,6 @@ pub async fn run() -> Result<()> {
                     }
                     tray::TrayCommand::ToggleFillers => {
                         daemon.handle_command(ipc::Request { command: "fillers".into(), arg: None });
-                    }
-                    tray::TrayCommand::ToggleAutoPaste => {
-                        daemon.handle_command(ipc::Request { command: "paste".into(), arg: None });
                     }
                     tray::TrayCommand::SetOverlay(m) => {
                         daemon.handle_command(ipc::Request { command: "overlay".into(), arg: Some(m) });

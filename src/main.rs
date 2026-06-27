@@ -50,10 +50,16 @@ enum Commands {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(config::LANGUAGES.iter().map(|(c, _)| *c)))]
         lang: Option<String>,
     },
-    /// Set or show output method (type, clipboard)
+    /// Set or show output method (type, clipboard) — legacy alias for `delivery`
     Output {
         #[arg(value_parser = ["type", "clipboard"])]
         output: Option<String>,
+    },
+    /// Set or show delivery mode (auto, type, clipboard). auto = type via input-method else
+    /// paste-chord; type = input-method only (else clipboard); clipboard = never inject, accumulate
+    Delivery {
+        #[arg(value_parser = ["auto", "type", "clipboard"])]
+        mode: Option<String>,
     },
     /// Toggle or set enter-after-type (on, off). Presses Enter after typing in type mode
     Enter {
@@ -188,6 +194,10 @@ async fn main() -> Result<()> {
                 Commands::Output { output } => ipc::Request {
                     command: "output".into(),
                     arg: output,
+                },
+                Commands::Delivery { mode } => ipc::Request {
+                    command: "delivery".into(),
+                    arg: mode,
                 },
                 Commands::Enter { state } => ipc::Request {
                     command: "enter".into(),
