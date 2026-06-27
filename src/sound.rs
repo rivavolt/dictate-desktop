@@ -24,6 +24,9 @@ fn play(name: &str) {
         let Ok(sink) = rodio::Sink::try_new(&handle) else {
             return;
         };
+        // A gentle cue, not a klaxon — the freedesktop clips play hot at full volume. There's no
+        // system "alert volume" on pipewire to defer to, so scale it here.
+        sink.set_volume(0.4);
         sink.append(source);
         // OutputStream isn't Send, so it lives here on the play thread (not a shared static); the
         // thread stays alive until the clip finishes.
